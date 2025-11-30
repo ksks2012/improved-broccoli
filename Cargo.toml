@@ -2,6 +2,10 @@
 name = "cautious-waddle"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "A JPEG XL decoder implementation in Rust"
+repository = "https://github.com/user/cautious-waddle"
+authors = ["Your Name <your.email@example.com>"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
