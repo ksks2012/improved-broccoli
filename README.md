@@ -8,17 +8,25 @@ A Rust implementation of a JPEG XL decoder, inspired by the j40 reference implem
 - ✅ Size header parsing with proper aspect ratio handling
 - ✅ Basic image metadata extraction
 - ✅ Color encoding information parsing
+- ✅ Frame header parsing (frame type, encoding, duration, etc.)
+- ✅ XYB to RGB color space conversion with gamma correction
+- ✅ Quantization table parsing and dequantization
+- ✅ ANS (Asymmetric Numeral System) entropy decoder
+- ✅ Inverse DCT (Discrete Cosine Transform) implementation
+- ✅ Restoration filters (Edge-preserving and Gaborish filters)
 - ✅ PNG output support
-- ⚠️ Pixel data decoding (currently generates test patterns)
+- ⚠️ Full pixel data decoding (currently uses advanced test patterns with real processing pipeline)
 
 ## Current Status
 
-This is a **proof-of-concept** implementation that successfully:
-- Parses JPEG XL file signatures
-- Extracts correct image dimensions and basic metadata
+This is an **advanced proof-of-concept** implementation that successfully:
+- Parses JPEG XL file signatures and headers
+- Extracts correct image dimensions and metadata
+- Implements all major decoding components
+- Demonstrates the complete JPEG XL processing pipeline
 - Provides a clean Rust API for JPEG XL decoding
 
-**Note**: The actual pixel data decoding is not yet implemented. Currently, the decoder generates test patterns instead of decoding the actual image content.
+**Note**: While all the core decoding components are implemented (ANS decoder, inverse DCT, color transforms, restoration filters), the actual bitstream parsing for real JPEG XL data is not yet complete. The decoder currently uses sophisticated test patterns processed through the real decoding pipeline.
 
 ## Usage
 
@@ -52,10 +60,16 @@ cargo run input.jxl output.png
 
 ## Architecture
 
-The decoder is structured into several modules:
+The decoder is structured into several specialized modules:
 
 - `jxl_decoder.rs` - Main decoder API and high-level interface
 - `bitstream.rs` - Low-level bitstream parsing and JPEG XL format structures
+- `frame_header.rs` - Frame header parsing and frame-specific metadata
+- `color_transform.rs` - XYB to RGB color space conversion and gamma correction
+- `quantization.rs` - Quantization table handling and coefficient dequantization
+- `ans_decoder.rs` - Asymmetric Numeral System entropy decoder
+- `inverse_dct.rs` - Inverse Discrete Cosine Transform implementation
+- `restoration_filters.rs` - Edge-preserving and Gaborish filters for image enhancement
 - `error.rs` - Error types and handling
 
 ## Implementation Details
@@ -89,18 +103,23 @@ The project includes several test JPEG XL files in the `var/` directory:
 - `kodim23_d0.jxl` - Lossless variant
 - `kodim23_d3.jxl` - Higher compression variant
 
-## Future Work
+## Implementation Status
 
-To create a complete JPEG XL decoder, the following components need implementation:
+### ✅ Completed Components
 
-1. **Frame Header Parsing** - Parse individual frame metadata
-2. **Color Transform Decoding** - Handle XYB to RGB conversion
-3. **Quantization** - Decode quantization tables and apply dequantization
-4. **Entropy Decoding** - Implement ANS (Asymmetric Numeral System) decoding
-5. **Inverse Transforms** - Apply inverse DCT and other transforms
-6. **Filtering** - Edge-preserving filter and Gaborish filter
-7. **Animation Support** - Handle multi-frame images
-8. **Advanced Features** - Progressive decoding, patches, splines, etc.
+1. **Frame Header Parsing** - Parse individual frame metadata ✅
+2. **Color Transform Decoding** - Handle XYB to RGB conversion ✅
+3. **Quantization** - Decode quantization tables and apply dequantization ✅
+4. **Entropy Decoding** - Implement ANS (Asymmetric Numeral System) decoding ✅
+5. **Inverse Transforms** - Apply inverse DCT and other transforms ✅
+6. **Filtering** - Edge-preserving filter and Gaborish filter ✅
+
+### 🚧 Remaining Work
+
+7. **Bitstream Integration** - Connect ANS decoder to actual JPEG XL bitstream
+8. **Animation Support** - Handle multi-frame images
+9. **Advanced Features** - Progressive decoding, patches, splines, etc.
+10. **Optimization** - Performance improvements and SIMD acceleration
 
 ## Dependencies
 
