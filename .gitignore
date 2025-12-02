@@ -1,5 +1,8 @@
 /target
 
+**/summary/**
+
+# image files
 *.png
 *.jpg
 *.jpeg
@@ -7,3 +10,9 @@
 *.bmp
 *.tiff
 *.jxl
+
+
+# backup
+**/bak/**
+*.bak
+*.backup
