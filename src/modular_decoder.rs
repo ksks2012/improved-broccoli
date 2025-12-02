@@ -279,15 +279,15 @@ impl ModularDecoder {
         let max_attempts = pixel_count.min(1000); // Limit attempts to avoid infinite loops
         
         while decoded_count < max_attempts && ans_state.can_decode() {
-            // Get symbol table (use first table if available, otherwise create default)
-            let symbol_table = if !self.ans_decoder.tables.is_empty() {
-                &self.ans_decoder.tables[0]
+            // Get distribution (use first distribution if available, otherwise skip)
+            let distribution = if !self.ans_decoder.distributions.is_empty() {
+                &self.ans_decoder.distributions[0]
             } else {
-                // Create a simple default symbol table for fallback
-                return Ok(residuals); // Skip ANS decoding if no tables available
+                // No distributions available, skip ANS decoding
+                return Ok(residuals);
             };
             
-            match ans_state.decode_symbol(reader, symbol_table) {
+            match ans_state.decode_symbol(reader, distribution) {
                 Ok(symbol) => {
                     // Convert symbol to signed residual
                     let residual = if symbol & 1 == 0 {
