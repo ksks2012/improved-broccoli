@@ -9,6 +9,8 @@ pub mod inverse_dct;
 pub mod restoration_filters;
 pub mod real_decoder;
 pub mod modular_decoder;
+pub mod transform_tree;
+pub mod predictor;
 
 pub use jxl_decoder::*;
 pub use error::*;
@@ -20,3 +22,5 @@ pub use inverse_dct::*;
 pub use restoration_filters::*;
 pub use real_decoder::*;
 pub use modular_decoder::*;
+pub use transform_tree::*;
+pub use predictor::*;
