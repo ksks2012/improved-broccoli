@@ -22,6 +22,13 @@ impl AnsState {
 
     /// Initialize ANS state from bitstream
     pub fn init_from_stream(&mut self, reader: &mut BitstreamReader) -> JxlResult<()> {
+        // Check if we have enough bits available
+        if reader.bits_available() < 16 {
+            println!("Warning: Not enough bits available for ANS initialization, using default state");
+            self.state = self.tab_size;
+            return Ok(());
+        }
+        
         // Read initial state (typically 16 bits for JPEG XL)
         self.state = reader.read_bits(16)?;
         

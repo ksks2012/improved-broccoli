@@ -18,6 +18,16 @@ impl BitstreamReader {
     pub fn get_data(&self) -> &Vec<u8> {
         &self.data
     }
+    
+    /// Get number of bits available for reading
+    pub fn bits_available(&self) -> usize {
+        let total_bits = self.data.len() * 8;
+        if self.bit_position >= total_bits {
+            0
+        } else {
+            total_bits - self.bit_position
+        }
+    }
 
     /// Read n bits from the stream
     pub fn read_bits(&mut self, n: usize) -> JxlResult<u32> {
