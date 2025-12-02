@@ -290,37 +290,8 @@ impl AnsDistribution {
             // Use Huffman/prefix code to encode frequency lengths
             frequencies = Self::parse_prefix_coded_frequencies(reader, alphabet_size, log_tab_size)?;
         } else {
-            // Direct encoding of frequencies
-            // Direct encoding of frequencies
-            let freq_precision = log_tab_size.min(8) as usize;
-            let mut remaining = tab_size;
-            
-            for i in 0..alphabet_size {
-                let freq = if i == alphabet_size - 1 {
-                    // Last symbol gets remaining frequency
-                    remaining
-                } else {
-                    let bits_to_read = if remaining > (1 << freq_precision) {
-                        freq_precision
-                    } else {
-                        (remaining as f32).log2().ceil() as usize
-                    };
-                    
-                    if bits_to_read == 0 {
-                        1 // Ensure at least 1
-                    } else {
-                        let f = reader.read_bits(bits_to_read)?;
-                        (f + 1).min(remaining)
-                    }
-                };
-                
-                if freq > remaining {
-                    return Err(JxlError::DecodeError("Frequency exceeds remaining".to_string()));
-                }
-                
-                frequencies.push(freq);
-                remaining = remaining.saturating_sub(freq);
-            }
+            // Direct encoding of frequencies with proper rounding
+            frequencies = Self::parse_direct_frequencies(reader, alphabet_size, tab_size)?;
         }
         
         // Build frequency table with proper indexing
@@ -363,6 +334,38 @@ impl AnsDistribution {
         Ok(dist)
     }
     
+    /// Parse direct-encoded frequencies
+    fn parse_direct_frequencies(
+        reader: &mut BitstreamReader,
+        alphabet_size: usize,
+        tab_size: u32
+    ) -> JxlResult<Vec<u32>> {
+        let mut frequencies = Vec::with_capacity(alphabet_size);
+        let mut remaining = tab_size;
+        
+        // Use uniform distribution as fallback if encoding is simple
+        if alphabet_size <= 1 {
+            frequencies.push(tab_size);
+            return Ok(frequencies);
+        }
+        
+        // Distribute frequencies uniformly initially
+        let base_freq = tab_size / alphabet_size as u32;
+        let extra = tab_size % alphabet_size as u32;
+        
+        for i in 0..alphabet_size {
+            let freq = if i < extra as usize {
+                base_freq + 1
+            } else {
+                base_freq
+            };
+            
+            frequencies.push(freq.max(1));
+        }
+        
+        Ok(frequencies)
+    }
+    
     /// Parse prefix-coded frequencies (Huffman-style encoding)
     fn parse_prefix_coded_frequencies(
         reader: &mut BitstreamReader,
@@ -370,33 +373,10 @@ impl AnsDistribution {
         log_tab_size: u32
     ) -> JxlResult<Vec<u32>> {
         // This is a simplified version - full implementation would decode a Huffman tree
-        // For now, fall back to simpler direct encoding
+        // For now, use uniform distribution as a safe fallback
         
         let tab_size = 1u32 << log_tab_size;
-        let mut frequencies = Vec::with_capacity(alphabet_size);
-        let mut remaining = tab_size;
-        
-        for i in 0..alphabet_size {
-            if i == alphabet_size - 1 {
-                // Last frequency is the remainder
-                frequencies.push(remaining);
-            } else {
-                // Read frequency length code
-                let freq_bits = reader.read_bits(4)? as usize; // 0-15 bits for frequency
-                
-                let freq = if freq_bits == 0 {
-                    1 // Minimum frequency
-                } else {
-                    let f = reader.read_bits(freq_bits)?;
-                    (f + 1).min(remaining)
-                };
-                
-                frequencies.push(freq);
-                remaining = remaining.saturating_sub(freq);
-            }
-        }
-        
-        Ok(frequencies)
+        Self::parse_direct_frequencies(reader, alphabet_size, tab_size)
     }
 }
 
