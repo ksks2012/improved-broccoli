@@ -124,6 +124,10 @@ impl FrameHeader {
         // Parse encoding type
         let is_modular = reader.read_bool()?;
         frame_header.encoding = FrameEncoding::from_bool(is_modular);
+        
+        // Debug output (can be removed in production)
+        // println!("DEBUG: Frame type bits: {}, is_modular: {}, encoding: {:?}", 
+        //          frame_type_bits, is_modular, frame_header.encoding);
 
         // Parse flags
         frame_header.flags = reader.read_bits(24)? as u64;

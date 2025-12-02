@@ -13,6 +13,11 @@ impl BitstreamReader {
             bit_position: 0,
         }
     }
+    
+    /// Get reference to the underlying data
+    pub fn get_data(&self) -> &Vec<u8> {
+        &self.data
+    }
 
     /// Read n bits from the stream
     pub fn read_bits(&mut self, n: usize) -> JxlResult<u32> {

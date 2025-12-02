@@ -1,4 +1,4 @@
-use cautious_waddle::{decode_jxl_file, JxlDecoder, JxlResult};
+use cautious_waddle::{decode_jxl_file, decode_real_jxl_file, JxlDecoder, JxlResult};
 use std::env;
 use std::path::Path;
 
@@ -82,6 +82,33 @@ fn main() -> JxlResult<()> {
                     eprintln!("Error creating decoder: {}", e);
                 }
             }
+        }
+    }
+    
+    // Try with the real decoder as well
+    println!("\n=== Testing Real JPEG XL Decoder ===");
+    println!("Attempting to decode with real bitstream parsing...");
+    
+    match decode_real_jxl_file(&input_file) {
+        Ok(frame) => {
+            println!("Successfully decoded with real decoder!");
+            println!("Real decoder - Image dimensions: {}x{}", frame.width, frame.height);
+            println!("Real decoder - Pixel format: {:?}", frame.format);
+            println!("Real decoder - Pixel type: {:?}", frame.pixel_type);
+            
+            let real_output = output_file.replace("output.png", "real_output.png");
+            match frame.save_as_png(&real_output) {
+                Ok(()) => {
+                    println!("Successfully saved real decoder image to: {}", real_output);
+                }
+                Err(e) => {
+                    eprintln!("Error saving real decoder PNG: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Real decoder error: {}", e);
+            println!("This is expected as real bitstream parsing is complex and may need additional work");
         }
     }
     
