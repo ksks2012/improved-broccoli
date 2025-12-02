@@ -117,6 +117,8 @@ pub struct JxlImageHeader {
     pub bits_per_sample: u32,
     pub exp_bits: u32,
     pub modular_16bit_buffers: bool,
+    pub extra_fields: bool,
+    pub all_default: bool,
 }
 
 impl JxlImageHeader {
@@ -243,6 +245,8 @@ impl JxlImageHeader {
                 bits_per_sample,
                 exp_bits,
                 modular_16bit_buffers,
+                extra_fields: extra_fields != 0,
+                all_default: false,
             })
         } else {
             // all_default case: use default values
@@ -259,6 +263,8 @@ impl JxlImageHeader {
                 bits_per_sample: 8,  // Default to 8-bit
                 exp_bits: 0,
                 modular_16bit_buffers: true,
+                extra_fields: false,
+                all_default: true,
             })
         }
     }

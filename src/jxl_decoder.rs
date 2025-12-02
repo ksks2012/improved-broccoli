@@ -187,11 +187,46 @@ impl JxlDecoder {
         let mut reader = BitstreamReader::new(remaining_data);
         
         // Parse the image header
+        println!("DEBUG: Before JxlImageHeader::parse, bit_pos={}", reader.get_bit_position());
         let header = JxlImageHeader::parse(&mut reader)?;
+        println!("DEBUG: After JxlImageHeader::parse, bit_pos={}, byte_pos={}", 
+                 reader.get_bit_position(), reader.byte_position());
+        
         let color_encoding = ColorEncoding::parse(&mut reader)?;
+        println!("DEBUG: After ColorEncoding::parse, bit_pos={}, byte_pos={}", 
+                 reader.get_bit_position(), reader.byte_position());
+        
+        // Parse number of extra channels (alpha, depth, etc.)
+        let num_extra_channels = reader.read_u32_with_config(0, 0, 1, 0, 2, 4, 1, 12)?;
+        println!("Number of extra channels: {}", num_extra_channels);
+        println!("DEBUG: After num_extra_channels, bit_pos={}, byte_pos={}", 
+                 reader.get_bit_position(), reader.byte_position());
+        
+        // Parse extra channel info
+        for i in 0..num_extra_channels {
+            // Each extra channel has: all_default flag, type, bit_depth, etc.
+            let all_default = reader.read_bool()?;
+            if !all_default {
+                // Read extra channel details (simplified - there are more fields in spec)
+                let _ec_type = reader.read_u32_with_config(0, 0, 1, 0, 2, 4, 1, 8)?;
+                let _ec_bits = reader.read_u32_with_config(0, 0, 1, 0, 2, 4, 1, 8)?;
+                // TODO: Parse remaining extra channel fields (dim_shift, name_len, etc.)
+            }
+            println!("  Extra channel {} parsed, bit_pos={}", i, reader.get_bit_position());
+        }
+        
+        // TEMPORARY: Skip to byte boundary (there should be extensions here, but let's skip for now)
+        println!("DEBUG: Before alignment, bit_pos={}", reader.get_bit_position());
+        reader.align_to_byte();
+        println!("DEBUG: After alignment, bit_pos={}", reader.get_bit_position());
+        
+        // TODO: Parse ToneMapping and Extensions correctly
+        // For now, we skip them to get to Frame header
         
         // Update position
-        self.position += reader.byte_position();
+        let bytes_read = reader.byte_position();
+        self.position += bytes_read;
+        println!("DEBUG: parse_image_header consumed {} bytes, position now: {}", bytes_read, self.position);
         
         // Create image info from parsed header
         self.image_info = Some(ImageInfo {
@@ -199,15 +234,85 @@ impl JxlDecoder {
             height: header.height,
             num_channels: if color_encoding.color_space == 1 { 1 } else { 3 },
             bits_per_sample: 8, // Assume 8-bit for now
-            has_alpha: false,   // TODO: parse from extra channels
+            has_alpha: num_extra_channels > 0,
             is_gray: color_encoding.color_space == 1,
-            num_extra_channels: 0, // TODO: parse extra channels
+            num_extra_channels,
         });
         
         self.header = Some(header);
         self.color_encoding = Some(color_encoding);
         
         Ok(())
+    }
+    
+    /// Read float16 value
+    fn read_f16(&mut self, reader: &mut BitstreamReader) -> JxlResult<f32> {
+        let bits = reader.read_bits(16)? as u16;
+        // Convert f16 to f32 (simplified - just read the bits for now)
+        // TODO: Proper f16 to f32 conversion
+        Ok(bits as f32)
+    }
+    
+    /// Parse extensions (between ImageMetadata and Frame)
+    fn parse_extensions(&mut self, reader: &mut BitstreamReader) -> JxlResult<()> {
+        // Read 64-bit extensions bitmask (as two 32-bit reads)
+        let ext_low = reader.read_bits(32)? as u64;
+        let ext_high = reader.read_bits(32)? as u64;
+        let extensions = ext_low | (ext_high << 32);
+        println!("DEBUG: Extensions bitmask: 0x{:016X}", extensions);
+        
+        // For each bit set, read extension size and skip data
+        let mut total_skip_bits = 0u64;
+        for i in 0..64 {
+            if (extensions >> i) & 1 != 0 {
+                // Extension i is present, read its size (64-bit)
+                let size_low = reader.read_bits(32)? as u64;
+                let size_high = reader.read_bits(32)? as u64;
+                let ext_size = size_low | (size_high << 32);
+                println!("DEBUG: Extension {} size: {} bits", i, ext_size);
+                total_skip_bits += ext_size;
+            }
+        }
+        
+        // Skip all extension data (bit by bit - inefficient but simple)
+        if total_skip_bits > 0 {
+            println!("DEBUG: Skipping {} bits of extension data", total_skip_bits);
+            for _ in 0..total_skip_bits {
+                reader.read_bits(1)?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Parse Table of Contents (TOC) after frame header
+    fn parse_toc(&mut self) -> JxlResult<usize> {
+        let remaining_data = self.data[self.position..].to_vec();
+        let mut reader = BitstreamReader::new(remaining_data);
+        
+        // Read permuted flag (1 bit)
+        let permuted = reader.read_bool()?;
+        if permuted {
+            // TODO: Handle permuted TOC
+            println!("Warning: Permuted TOC not yet supported");
+        }
+        
+        // Align to byte boundary
+        reader.align_to_byte();
+        
+        // Read single section size (for simple case: 1 pass, 1 group)
+        let single_size = reader.read_u32_with_config(0, 10, 1024, 14, 17408, 22, 4211712, 30)? as usize;
+        
+        // Align to byte boundary again
+        reader.align_to_byte();
+        
+        println!("DEBUG: TOC single_size = {} bytes", single_size);
+        
+        // Update position to after TOC
+        self.position += reader.byte_position();
+        println!("DEBUG: After TOC, position = {}", self.position);
+        
+        Ok(single_size)
     }
 
     /// Check if this appears to be lossless compression
@@ -274,12 +379,15 @@ impl JxlDecoder {
         // Parse frame header
         self.parse_frame_header()?;
         
+        // Parse Table of Contents (TOC)
+        let _frame_data_size = self.parse_toc()?;
+        
         // Get frame info
         let width = info.width;
         let height = info.height;
         
         // Check for lossless mode and adjust decoding accordingly
-        let is_lossless = self.is_lossless();
+        let _is_lossless = self.is_lossless();
         println!("Compression mode: {}", self.get_compression_info());
         
         // Fall back to test patterns for demonstration
@@ -324,15 +432,28 @@ impl JxlDecoder {
             let remaining_data = self.data[start_pos..].to_vec();
             let mut reader = BitstreamReader::new(remaining_data);
             
+            // Debug: Show bytes at this position
+            if start_pos < self.data.len() {
+                let bytes_to_show = 10.min(self.data.len() - start_pos);
+                println!("DEBUG: Trying frame header at offset {}, bytes: {:02X?}", 
+                         start_pos, &self.data[start_pos..start_pos + bytes_to_show]);
+            }
+            
             // Try to parse frame header at this position
             match FrameHeader::parse(&mut reader, false) {
                 Ok(frame_header) => {
-                    // println!("DEBUG: Found frame header at offset {}", start_pos);
+                    println!("DEBUG: Found frame header at offset {}, reader consumed {} bytes", 
+                             start_pos, reader.byte_position());
+                    println!("  Frame encoding: {:?}", frame_header.encoding);
                     self.position = start_pos + reader.byte_position();
+                    println!("  Updated position to: {}", self.position);
                     self.frame_header = Some(frame_header);
                     return Ok(());
                 }
-                Err(_) => continue, // Try next position
+                Err(e) => {
+                    println!("DEBUG: Failed to parse frame header at offset {}: {}", start_pos, e);
+                    continue; // Try next position
+                }
             }
         }
         
@@ -374,18 +495,42 @@ impl JxlDecoder {
     /// Decode color frame using the full pipeline
     fn decode_color_frame(&mut self, width: u32, height: u32) -> JxlResult<Frame> {
         let pixel_count = (width * height) as usize;
-        let is_lossless = self.is_lossless();
         
-        if is_lossless {
-            // For lossless (Modular) images, try to decode the actual bitstream
-            println!("Decoding lossless Modular image from bitstream...");
+        // Check frame encoding to decide decoding path
+        let frame_header = self.frame_header.as_ref().ok_or_else(|| {
+            JxlError::ParseError("Frame header not parsed".to_string())
+        })?;
+        
+        let is_modular = matches!(frame_header.encoding, FrameEncoding::Modular);
+        
+        if is_modular {
+            // True Modular encoding - decode from bitstream
+            println!("Decoding Modular image from bitstream...");
             
             // Create a bitstream reader from current position
+            println!("Current position in bitstream: {} / {} bytes", self.position, self.data.len());
+            let end_pos = (self.position + 20).min(self.data.len());
+            println!("Next 20 bytes: {:02X?}", &self.data[self.position..end_pos]);
+            println!("Remaining data size: {}", self.data.len() - self.position);
+            
             let remaining_data = self.data[self.position..].to_vec();
             let mut reader = BitstreamReader::new(remaining_data);
             
+            // Calculate number of channels (base color + extra channels like alpha)
+            // For Modular mode: num_channels = (grayscale ? 1 : 3) + num_extra_channels
+            let image_info = self.image_info.as_ref().ok_or_else(|| JxlError::ParseError("Image info not available".to_string()))?;
+            let base_channels = if image_info.is_gray { 1 } else { 3 };
+            let num_channels = base_channels + image_info.num_extra_channels;
+            
+            // Get bit depth from header
+            let header = self.header.as_ref().ok_or_else(|| JxlError::ParseError("Header not available".to_string()))?;
+            let bit_depth = header.bits_per_sample as u8;
+            
+            println!("Decoding Modular image with {} channels ({} base + {} extra), {} bits/sample", 
+                     num_channels, base_channels, image_info.num_extra_channels, bit_depth);
+            
             // Create Modular decoder
-            let mut modular_decoder = ModularDecoder::new(width, height, 3); // RGB
+            let mut modular_decoder = ModularDecoder::new(width, height, num_channels, bit_depth);
             
             // Try to decode the Modular bitstream
             match modular_decoder.decode(&mut reader) {
@@ -431,7 +576,10 @@ impl JxlDecoder {
                 }
             }
         } else {
-            // Step 1: Create simulated XYB data for lossy mode
+            // VarDct encoding (may be lossless or lossy)
+            println!("Decoding VarDct image...");
+            
+            // Step 1: Create simulated XYB data for VarDct mode
             let mut xyb_data = Vec::with_capacity(pixel_count * 3);
             
             // Generate XYB test pattern that will convert nicely to RGB

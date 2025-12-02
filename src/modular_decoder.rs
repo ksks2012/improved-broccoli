@@ -70,7 +70,7 @@ pub struct ModularDecoder {
 }
 
 impl ModularDecoder {
-    pub fn new(width: u32, height: u32, channels: u32) -> Self {
+    pub fn new(width: u32, height: u32, channels: u32, bit_depth: u8) -> Self {
         Self { 
             width, 
             height, 
@@ -78,7 +78,7 @@ impl ModularDecoder {
             transform_tree: None,
             predictors: Vec::new(),
             ans_decoder: AnsDecoder::new(),
-            bit_depth: 8,
+            bit_depth,
             orig_width: width,
             orig_height: height,
             wp_padded: width,
@@ -95,17 +95,50 @@ impl ModularDecoder {
     /// Parse Modular header from bitstream
     pub fn parse_header(&mut self, reader: &mut BitstreamReader) -> JxlResult<()> {
         println!("Parsing Modular header...");
+        println!("Using bit_depth from ImageMetadata: {}", self.bit_depth);
         
-        // Parse bit depth
-        self.bit_depth = reader.read_bits(5)? as u8 + 1;
-        println!("Bit depth: {}", self.bit_depth);
+        // Parse use_global_tree flag (1 bit)
+        let use_global_tree = reader.read_bool()?;
+        println!("use_global_tree: {}", use_global_tree);
         
-        // Parse transform tree if present
-        if reader.read_bool()? {
-            println!("Parsing transform tree...");
+        if use_global_tree {
+            println!("Warning: Global tree not yet supported, skipping...");
+            // TODO: Parse global tree
+        }
+        
+        // Parse WPHeader (Weighted Prediction header)
+        let default_wp = reader.read_bool()?;
+        if !default_wp {
+            println!("Warning: Non-default WP parameters not yet supported, skipping...");
+            // p1 (5 bits), p2 (5 bits), p3[5] (5 bits each), w[4] (4 bits each)
+            let _p1 = reader.read_bits(5)?;
+            let _p2 = reader.read_bits(5)?;
+            for _ in 0..5 {
+                let _p3 = reader.read_bits(5)?;
+            }
+            for _ in 0..4 {
+                let _w = reader.read_bits(4)?;
+            }
+        }
+        
+        // Debug: Check bitstream position before reading transforms
+        println!("Bitstream position before nb_transforms: bit_pos={}, byte={}, bits_available={}", 
+                 reader.get_bit_position(), reader.byte_position(), reader.bits_available());
+        let byte_pos = reader.byte_position();
+        if byte_pos < reader.get_data().len() {
+            println!("Next 10 bytes from byte {}: {:02X?}", byte_pos, 
+                     &reader.get_data()[byte_pos..(byte_pos+10).min(reader.get_data().len())]);
+        }
+        
+        // Parse number of transforms
+        let nb_transforms = reader.read_u32_with_config(0, 0, 1, 0, 2, 4, 18, 8)? as usize;
+        println!("Number of transforms: {}", nb_transforms);
+        
+        if nb_transforms > 0 {
+            println!("Parsing {} transform(s)...", nb_transforms);
             self.transform_tree = Some(TransformNode::parse(reader)?);
         } else {
-            println!("No transform tree present");
+            println!("No transforms");
         }
         
         // Parse predictors for each channel
@@ -116,9 +149,18 @@ impl ModularDecoder {
             self.predictors.push(PredictorSystem::new(predictor_type));
         }
         
-        // Initialize ANS decoder
+        // Initialize ANS decoder (optional - skip if fails)
         println!("Initializing ANS decoder...");
-        self.ans_decoder.init_from_stream(reader)?;
+        match self.ans_decoder.init_from_stream(reader) {
+            Ok(()) => {
+                println!("ANS decoder initialized successfully with {} distributions", 
+                         self.ans_decoder.num_distributions());
+            }
+            Err(e) => {
+                println!("Warning: ANS decoder initialization failed: {}", e);
+                println!("Continuing without ANS decoder...");
+            }
+        }
         
         Ok(())
     }
