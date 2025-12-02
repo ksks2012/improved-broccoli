@@ -85,6 +85,21 @@ impl QuantizationTable {
         
         dequantized
     }
+    
+    /// Check if this quantization table represents lossless encoding
+    /// In lossless mode, all quantization values should be 1.0 (no quantization loss)
+    pub fn is_lossless(&self) -> bool {
+        let epsilon = 0.01; // Small tolerance for floating point comparison
+        
+        // Check if DC and AC quantization factors are unity
+        let dc_is_unity = (self.dc_quant - 1.0).abs() < epsilon;
+        let ac_is_unity = (self.ac_quant - 1.0).abs() < epsilon;
+        
+        // Check if all matrix values are unity
+        let matrix_is_unity = self.values.iter().all(|&v| (v - 1.0).abs() < epsilon);
+        
+        dc_is_unity && ac_is_unity && matrix_is_unity
+    }
 }
 
 impl Default for QuantizationTable {
@@ -153,6 +168,11 @@ impl QuantizationMatrixSet {
         component: usize
     ) -> [f32; DCT_COEFFICIENTS] {
         self.get_table(component).dequantize_block(coefficients)
+    }
+    
+    /// Check if all quantization tables represent lossless encoding
+    pub fn is_lossless(&self) -> bool {
+        self.luma_table.is_lossless() && self.chroma_table.is_lossless()
     }
 }
 
