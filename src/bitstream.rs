@@ -31,7 +31,11 @@ impl BitstreamReader {
 
     /// Read n bits from the stream
     pub fn read_bits(&mut self, n: usize) -> JxlResult<u32> {
-        if n == 0 || n > 32 {
+        if n == 0 {
+            // Reading 0 bits returns 0
+            return Ok(0);
+        }
+        if n > 32 {
             return Err(JxlError::ParseError(format!("Invalid bit count: {}", n)));
         }
 
