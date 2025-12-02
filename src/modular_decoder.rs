@@ -369,13 +369,16 @@ impl ModularDecoder {
     }
     
     /// Apply transform tree inverse operations in correct order
+    /// 
+    /// CRITICAL: Transform tree is encoded in post-order traversal in the bitstream.
+    /// For inverse transforms, we must apply them in REVERSE order:
+    /// 1. Apply current node's inverse transform FIRST
+    /// 2. Then recursively apply children's inverse transforms
+    /// 
+    /// Example: If bitstream has [Squeeze, RCT, Palette] (post-order encoding),
+    /// inverse should apply: Palette⁻¹ → RCT⁻¹ → Squeeze⁻¹
     fn apply_transform_tree_inverse(&self, transform_tree: &TransformNode, channels: &mut Vec<ModularChannel>) -> JxlResult<()> {
-        // Process children first (depth-first)
-        for child in &transform_tree.children {
-            self.apply_transform_tree_inverse(child, channels)?;
-        }
-        
-        // Apply the inverse transform for this node
+        // Step 1: Apply the inverse transform for THIS node FIRST
         match transform_tree.transform {
             Transform::Identity => {
                 println!("Applying Identity transform (no-op)");
@@ -408,6 +411,11 @@ impl ModularDecoder {
                 println!("Applying inverse XYB transform");
                 self.apply_inverse_xyb_transform(transform_tree, channels)?;
             }
+        }
+        
+        // Step 2: Then process children (depth-first)
+        for child in &transform_tree.children {
+            self.apply_transform_tree_inverse(child, channels)?;
         }
         
         Ok(())
