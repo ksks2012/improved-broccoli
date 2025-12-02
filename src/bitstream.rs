@@ -95,6 +95,11 @@ impl BitstreamReader {
     pub fn byte_position(&self) -> usize {
         (self.bit_position + 7) / 8
     }
+    
+    /// Get current bit position (for debugging)
+    pub fn get_bit_position(&self) -> usize {
+        self.bit_position
+    }
 }
 
 /// JPEG XL Image Header information
@@ -109,9 +114,42 @@ pub struct JxlImageHeader {
     pub preview_height: u32,
     pub animation_tps_numerator: u32,
     pub animation_tps_denominator: u32,
+    pub bits_per_sample: u32,
+    pub exp_bits: u32,
+    pub modular_16bit_buffers: bool,
 }
 
 impl JxlImageHeader {
+    /// Parse bit depth from bitstream
+    fn parse_bit_depth(reader: &mut BitstreamReader) -> JxlResult<(u32, u32)> {
+        let is_float = reader.read_bool()?;
+        
+        if is_float {
+            // Float sample
+            let bpp = reader.read_u32_with_config(32, 0, 16, 0, 24, 0, 1, 6)?;
+            let exp_bits = reader.read_bits(4)? + 1;
+            
+            let mantissa_bits = bpp - exp_bits - 1;
+            if mantissa_bits < 2 || mantissa_bits > 23 {
+                return Err(JxlError::ParseError(format!("Invalid mantissa bits: {}", mantissa_bits)));
+            }
+            if exp_bits < 2 || exp_bits > 8 {
+                return Err(JxlError::ParseError(format!("Invalid exp bits: {}", exp_bits)));
+            }
+            
+            Ok((bpp, exp_bits))
+        } else {
+            // Integer sample
+            let bpp = reader.read_u32_with_config(8, 0, 10, 0, 12, 0, 1, 6)?;
+            
+            if bpp < 1 || bpp > 31 {
+                return Err(JxlError::ParseError(format!("Invalid bpp: {}", bpp)));
+            }
+            
+            Ok((bpp, 0))
+        }
+    }
+    
     /// Parse the image header from bitstream
     pub fn parse(reader: &mut BitstreamReader) -> JxlResult<Self> {
         // Parse Size Header according to j40__size_header
@@ -184,19 +222,45 @@ impl JxlImageHeader {
                     animation_tps_denominator = reader.read_u32()?;
                 }
             }
+            
+            // Parse bit depth (always present after extra_fields for non-default)
+            let (bits_per_sample, exp_bits) = Self::parse_bit_depth(reader)?;
+            let modular_16bit_buffers = reader.read_bool()?;
+            
+            println!("Parsed bit_depth: {} bits, exp_bits: {}, modular_16bit: {}", 
+                     bits_per_sample, exp_bits, modular_16bit_buffers);
+            
+            Ok(JxlImageHeader {
+                width,
+                height,
+                orientation,
+                intrinsic_width,
+                intrinsic_height,
+                preview_width,
+                preview_height,
+                animation_tps_numerator,
+                animation_tps_denominator,
+                bits_per_sample,
+                exp_bits,
+                modular_16bit_buffers,
+            })
+        } else {
+            // all_default case: use default values
+            Ok(JxlImageHeader {
+                width,
+                height,
+                orientation: 1,
+                intrinsic_width: width,
+                intrinsic_height: height,
+                preview_width: 0,
+                preview_height: 0,
+                animation_tps_numerator: 10,
+                animation_tps_denominator: 1,
+                bits_per_sample: 8,  // Default to 8-bit
+                exp_bits: 0,
+                modular_16bit_buffers: true,
+            })
         }
-
-        Ok(JxlImageHeader {
-            width,
-            height,
-            orientation,
-            intrinsic_width,
-            intrinsic_height,
-            preview_width,
-            preview_height,
-            animation_tps_numerator,
-            animation_tps_denominator,
-        })
     }
 }
 
