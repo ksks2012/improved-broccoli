@@ -266,33 +266,49 @@ impl JxlDecoder {
         // Parse the image header
         println!("DEBUG: Before JxlImageHeader::parse, bit_pos={}", reader.get_bit_position());
         let header = JxlImageHeader::parse(&mut reader)?;
-        println!("DEBUG: After JxlImageHeader::parse, bit_pos={}, byte_pos={}", 
-                 reader.get_bit_position(), reader.byte_position());
+        println!("DEBUG: After JxlImageHeader::parse, bit_pos={}, byte_pos={}, all_default={}", 
+                 reader.get_bit_position(), reader.byte_position(), header.all_default);
         
-        let color_encoding = ColorEncoding::parse(&mut reader)?;
-        println!("DEBUG: After ColorEncoding::parse, bit_pos={}, byte_pos={}", 
-                 reader.get_bit_position(), reader.byte_position());
-        
-        // Parse number of extra channels (alpha, depth, etc.)
-        let num_extra_channels = reader.read_u32_with_config(0, 0, 1, 0, 2, 4, 1, 12)?;
-        println!("Number of extra channels: {}", num_extra_channels);
-        println!("DEBUG: After num_extra_channels, bit_pos={}, byte_pos={}", 
-                 reader.get_bit_position(), reader.byte_position());
-        
-        // Parse extra channel info
-        for i in 0..num_extra_channels {
-            // Each extra channel has: all_default flag, type, bit_depth, etc.
-            let all_default = reader.read_bool()?;
-            if !all_default {
-                // Read extra channel details (simplified - there are more fields in spec)
-                let _ec_type = reader.read_u32_with_config(0, 0, 1, 0, 2, 4, 1, 8)?;
-                let _ec_bits = reader.read_u32_with_config(0, 0, 1, 0, 2, 4, 1, 8)?;
-                // TODO: Parse remaining extra channel fields (dim_shift, name_len, etc.)
+        let (color_encoding, num_extra_channels) = if header.all_default {
+            // When all_default=1, use default values without parsing
+            // Default: sRGB color space, no extra channels
+            let default_color = ColorEncoding {
+                color_space: 0,  // RGB
+                white_point: 1,  // D65
+                primaries: 1,    // sRGB
+                gamma: 0.0,      // Not used for sRGB
+            };
+            println!("DEBUG: Using default color encoding and 0 extra channels (all_default=1)");
+            (default_color, 0)
+        } else {
+            // Parse color encoding and extra channels normally
+            let color_encoding = ColorEncoding::parse(&mut reader)?;
+            println!("DEBUG: After ColorEncoding::parse, bit_pos={}, byte_pos={}", 
+                     reader.get_bit_position(), reader.byte_position());
+            
+            // Parse number of extra channels (alpha, depth, etc.)
+            let num_extra_channels = reader.read_u32_with_config(0, 0, 1, 0, 2, 4, 1, 12)?;
+            println!("Number of extra channels: {}", num_extra_channels);
+            println!("DEBUG: After num_extra_channels, bit_pos={}, byte_pos={}", 
+                     reader.get_bit_position(), reader.byte_position());
+            
+            // Parse extra channel info
+            for i in 0..num_extra_channels {
+                // Each extra channel has: all_default flag, type, bit_depth, etc.
+                let all_default = reader.read_bool()?;
+                if !all_default {
+                    // Read extra channel details (simplified - there are more fields in spec)
+                    let _ec_type = reader.read_u32_with_config(0, 0, 1, 0, 2, 4, 1, 8)?;
+                    let _ec_bits = reader.read_u32_with_config(0, 0, 1, 0, 2, 4, 1, 8)?;
+                    // TODO: Parse remaining extra channel fields (dim_shift, name_len, etc.)
+                }
+                println!("  Extra channel {} parsed, bit_pos={}", i, reader.get_bit_position());
             }
-            println!("  Extra channel {} parsed, bit_pos={}", i, reader.get_bit_position());
-        }
+            
+            (color_encoding, num_extra_channels)
+        };
         
-        // TEMPORARY: Skip to byte boundary (there should be extensions here, but let's skip for now)
+        // Align to byte boundary before Frame Header
         println!("DEBUG: Before alignment, bit_pos={}", reader.get_bit_position());
         reader.align_to_byte();
         println!("DEBUG: After alignment, bit_pos={}", reader.get_bit_position());

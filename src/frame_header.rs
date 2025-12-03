@@ -82,7 +82,8 @@ pub struct FrameHeader {
 
 impl FrameHeader {
     /// Parse frame header from bitstream
-    pub fn parse(reader: &mut BitstreamReader, all_default: bool) -> JxlResult<Self> {
+    /// Note: This function reads all_default from the bitstream, ignoring the parameter
+    pub fn parse(reader: &mut BitstreamReader, _all_default_ignored: bool) -> JxlResult<Self> {
         let mut frame_header = FrameHeader {
             frame_type: FrameType::RegularFrame,
             encoding: FrameEncoding::VarDct,
@@ -113,6 +114,9 @@ impl FrameHeader {
             jpeg_upsampling_y: Vec::new(),
         };
 
+        // ALWAYS read all_default from bitstream first
+        let all_default = reader.read_bool()?;
+        
         if all_default {
             return Ok(frame_header);
         }

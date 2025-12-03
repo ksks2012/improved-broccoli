@@ -155,20 +155,26 @@ impl JxlImageHeader {
     /// Parse the image header from bitstream
     pub fn parse(reader: &mut BitstreamReader) -> JxlResult<Self> {
         // Parse Size Header according to j40__size_header
-        let div8 = reader.read_bits(1)?;
+        let small = reader.read_bits(1)?;  // Note: This is "small", not "div8"
         
-        let height = if div8 != 0 {
-            (reader.read_bits(5)? + 1) * 8
+        let height = if small != 0 {
+            // small=1: Use ysize_div8 encoding with U32 config
+            let height_div8 = reader.read_u32_with_config(0, 0, 1, 0, 5, 0, 9, 0)?;
+            (height_div8 + 1) * 8
         } else {
+            // small=0: Use full size encoding
             reader.read_u32_with_config(1, 9, 1, 13, 1, 18, 1, 30)?
         };
         
         let ratio = reader.read_bits(3)?;
         let width = match ratio {
             0 => {
-                if div8 != 0 {
-                    (reader.read_bits(5)? + 1) * 8
+                if small != 0 {
+                    // small=1: Use xsize_div8 encoding with U32 config
+                    let width_div8 = reader.read_u32_with_config(0, 0, 1, 0, 5, 0, 9, 0)?;
+                    (width_div8 + 1) * 8
                 } else {
+                    // small=0: Use full size encoding
                     reader.read_u32_with_config(1, 9, 1, 13, 1, 18, 1, 30)?
                 }
             }
