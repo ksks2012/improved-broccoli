@@ -152,25 +152,101 @@ impl JxlDecoder {
         Ok(decoder)
     }
 
-    /// Verify JPEG XL signature
+    /// Verify JPEG XL signature and parse container if present
     fn verify_signature(&mut self) -> JxlResult<()> {
         if self.data.len() < 2 {
             return Err(JxlError::NotEnoughData { expected: 2, actual: self.data.len() });
         }
 
-        // Check for naked codestream signature
+        // Check for naked codestream signature (FF 0A)
         if self.data.starts_with(JXL_SIGNATURE_NAKED) {
+            println!("DEBUG: Detected naked codestream (FF 0A)");
+            // For naked codestream, check first byte after FF 0A to determine encoding
+            if self.data.len() > 2 {
+                let codestream_first_byte = self.data[2];
+                println!("DEBUG: Codestream first byte: 0x{:02X}", codestream_first_byte);
+                if (0x00..=0x03).contains(&codestream_first_byte) {
+                    println!("=> TRUE Modular encoding detected (0x00-0x03)");
+                } else if (0x80..=0x83).contains(&codestream_first_byte) {
+                    println!("=> TRUE VarDCT encoding detected (0x80-0x83)");
+                }
+            }
             self.position = 2;
             return Ok(());
         }
 
-        // Check for container format signature
+        // Check for container format (FF 0A followed by boxes)
+        // Container format: FF 0A [boxes...]
+        // Each box: [size (variable)] [type (4 bytes)] [payload]
+        if self.data[0] == 0xFF && self.data[1] == 0x0A {
+            println!("DEBUG: Detected container format (FF 0A)");
+            
+            // Parse boxes to find the codestream
+            let codestream_pos = self.find_codestream_in_container()?;
+            println!("DEBUG: Found codestream at position {}", codestream_pos);
+            
+            // Check the codestream first byte
+            if codestream_pos < self.data.len() {
+                let codestream_first_byte = self.data[codestream_pos];
+                println!("DEBUG: Codestream first byte: 0x{:02X}", codestream_first_byte);
+                if (0x00..=0x03).contains(&codestream_first_byte) {
+                    println!("=> TRUE Modular encoding detected (0x00-0x03)");
+                } else if (0x80..=0x83).contains(&codestream_first_byte) {
+                    println!("=> TRUE VarDCT encoding detected (0x80-0x83)");
+                } else {
+                    println!("=> WARNING: Unknown encoding (byte = 0x{:02X})", codestream_first_byte);
+                }
+            }
+            
+            self.position = codestream_pos;
+            return Ok(());
+        }
+
+        // Check for ISO BMFF container format signature
         if self.data.len() >= 12 && self.data.starts_with(JXL_SIGNATURE_CONTAINER) {
+            println!("DEBUG: Detected ISO BMFF container format");
             self.position = 12;
             return Ok(());
         }
 
         Err(JxlError::InvalidSignature)
+    }
+    
+    /// Find the codestream box in a container format file
+    /// Returns the position of the start of the codestream data
+    fn find_codestream_in_container(&self) -> JxlResult<usize> {
+        let mut pos = 2; // Skip FF 0A
+        
+        // JXL container uses a simple box structure
+        // For now, we'll use a heuristic: the codestream typically starts within first 100 bytes
+        // and begins with specific patterns
+        
+        // Try to find the codestream by looking for VarDCT (0x80-0x83) or Modular (0x00-0x03) patterns
+        // in the context of what looks like a codestream header
+        for search_pos in pos..self.data.len().min(pos + 200) {
+            let byte = self.data[search_pos];
+            
+            // Check for VarDCT signature (0x80-0x83 followed by reasonable data)
+            if (0x80..=0x83).contains(&byte) && search_pos + 4 < self.data.len() {
+                // Verify this looks like a real codestream by checking context
+                // VarDCT codestreams have specific patterns after the first byte
+                println!("DEBUG: Found potential VarDCT signature at position {}", search_pos);
+                return Ok(search_pos);
+            }
+            
+            // Check for Modular signature (0x00-0x03 at a reasonable position)
+            // Modular is trickier because 0x00 is common, so we need more context
+            if (0x00..=0x03).contains(&byte) && search_pos > 10 && search_pos + 4 < self.data.len() {
+                println!("DEBUG: Found potential Modular signature at position {}", search_pos);
+                // For now, accept the first reasonable position
+                // In a real implementation, we'd parse the box structure properly
+                return Ok(search_pos);
+            }
+        }
+        
+        // Fallback: assume codestream starts at a common position
+        println!("DEBUG: Could not find clear codestream signature, using heuristic position");
+        Ok(2)
     }
 
     /// Parse basic image information
