@@ -12,6 +12,7 @@ pub mod modular_decoder;
 pub mod vardct_decoder;
 pub mod transform_tree;
 pub mod predictor;
+pub mod minimal_modular_encoder;
 
 pub use jxl_decoder::*;
 pub use error::*;
@@ -26,3 +27,4 @@ pub use modular_decoder::*;
 pub use vardct_decoder::*;
 pub use transform_tree::*;
 pub use predictor::*;
+pub use minimal_modular_encoder::*;
