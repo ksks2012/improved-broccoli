@@ -383,29 +383,74 @@ impl JxlDecoder {
         let remaining_data = self.data[self.position..].to_vec();
         let mut reader = BitstreamReader::new(remaining_data);
         
+        // Get frame dimensions and parameters for nsections calculation
+        let info = self.image_info.as_ref().ok_or_else(|| 
+            JxlError::ParseError("Image info not available for TOC".to_string()))?;
+        let frame_header = self.frame_header.as_ref().ok_or_else(|| 
+            JxlError::ParseError("Frame header not available for TOC".to_string()))?;
+        
+        let width = info.width;
+        let height = info.height;
+        let group_size_shift = frame_header.group_size_shift;
+        let num_passes = frame_header.num_passes;
+        
+        // Calculate num_groups and num_lf_groups following j40
+        let grows = (height + ((1 << group_size_shift) - 1)) >> group_size_shift;
+        let gcolumns = (width + ((1 << group_size_shift) - 1)) >> group_size_shift;
+        let num_groups = grows as u64 * gcolumns as u64;
+        
+        let ggrows = (height + ((8 << group_size_shift) - 1)) >> (group_size_shift + 3);
+        let ggcolumns = (width + ((8 << group_size_shift) - 1)) >> (group_size_shift + 3);
+        let num_lf_groups = ggrows as u64 * ggcolumns as u64;
+        
+        // Calculate nsections
+        let nsections = if num_passes == 1 && num_groups == 1 {
+            1
+        } else {
+            1 /*lf_global*/ + num_lf_groups /*lf_group*/ +
+            1 /*hf_global + hf_pass*/ + num_passes as u64 * num_groups /*group_pass*/
+        };
+        
+        println!("DEBUG: TOC calculation: width={}, height={}, group_size_shift={}", 
+                 width, height, group_size_shift);
+        println!("DEBUG: TOC: num_groups={}, num_lf_groups={}, num_passes={}, nsections={}", 
+                 num_groups, num_lf_groups, num_passes, nsections);
+        
         // Read permuted flag (1 bit)
         let permuted = reader.read_bool()?;
         if permuted {
-            // TODO: Handle permuted TOC
-            println!("Warning: Permuted TOC not yet supported");
+            // TODO: Handle permuted TOC with code_spec and permutation
+            println!("Warning: Permuted TOC not yet fully supported");
+            // For now, skip the permutation data - this needs proper implementation
         }
         
-        // Align to byte boundary
-        reader.align_to_byte();
+        // Align to byte boundary after permuted flag (and potential permutation data)
+        self.reader.align_to_byte();
         
-        // Read single section size (for simple case: 1 pass, 1 group)
-        let single_size = reader.read_u32_with_config(0, 10, 1024, 14, 17408, 22, 4211712, 30)? as usize;
+        let mut section_sizes = Vec::new();
         
-        // Align to byte boundary again
-        reader.align_to_byte();
+        if nsections == 1 {
+            // Single section case
+            let single_size = self.reader.read_u32_with_config(0, 10, 1024, 14, 17408, 22, 4211712, 30)? as usize;
+            section_sizes.push(single_size);
+            println!("DEBUG: TOC single_size = {} bytes", single_size);
+        } else {
+            // Multiple sections case
+            for i in 0..nsections {
+                let size = self.reader.read_u32_with_config(0, 10, 1024, 14, 17408, 22, 4211712, 30)? as usize;
+                section_sizes.push(size);
+                println!("DEBUG: TOC section[{}] size = {} bytes", i, size);
+            }
+        }
         
-        println!("DEBUG: TOC single_size = {} bytes", single_size);
+        // Align to byte boundary again - this is where LfGlobal data starts
+        self.reader.align_to_byte();
         
-        // Update position to after TOC
-        self.position += reader.byte_position();
-        println!("DEBUG: After TOC, position = {}", self.position);
+        println!("DEBUG: After TOC, bit_pos={}, byte_pos={}", 
+                 self.reader.get_bit_position(), self.reader.byte_position());
         
-        Ok(single_size)
+        // Return total size (first section is lf_global)
+        Ok(section_sizes.get(0).copied().unwrap_or(0))
     }
 
     /// Check if this appears to be lossless compression

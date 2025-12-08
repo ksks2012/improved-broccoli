@@ -78,6 +78,7 @@ pub struct FrameHeader {
     pub jpeg_upsampling: Vec<u8>,
     pub jpeg_upsampling_x: Vec<u8>,
     pub jpeg_upsampling_y: Vec<u8>,
+    pub num_passes: u32,
 }
 
 impl FrameHeader {
@@ -103,8 +104,8 @@ impl FrameHeader {
             extra_channel_blending: Vec::new(),
             upsampling: 1,
             ec_upsampling: Vec::new(),
-            group_size_shift: 1,
-            x_qm_scale: 2,
+            group_size_shift: 8,  // Default is 8, not 1 (256x256 groups)
+            x_qm_scale: 3,        // j40 default is 3
             b_qm_scale: 2,
             passes_def: Vec::new(),
             downsample: 1,
@@ -112,12 +113,15 @@ impl FrameHeader {
             jpeg_upsampling: Vec::new(),
             jpeg_upsampling_x: Vec::new(),
             jpeg_upsampling_y: Vec::new(),
+            num_passes: 1,        // Default 1 pass
         };
 
         // ALWAYS read all_default from bitstream first
         let all_default = reader.read_bool()?;
+        println!("DEBUG FrameHeader: all_default={}", all_default);
         
         if all_default {
+            println!("DEBUG FrameHeader: Using defaults (VarDct, RegularFrame)");
             return Ok(frame_header);
         }
 
@@ -129,9 +133,9 @@ impl FrameHeader {
         let is_modular = reader.read_bool()?;
         frame_header.encoding = FrameEncoding::from_bool(is_modular);
         
-        // Debug output (can be removed in production)
-        // println!("DEBUG FrameHeader: frame_type_bits={}, is_modular={}, encoding={:?}", 
-        //          frame_type_bits, is_modular, frame_header.encoding);
+        // Debug output
+        println!("DEBUG FrameHeader: frame_type_bits={}, is_modular={}, encoding={:?}", 
+                 frame_type_bits, is_modular, frame_header.encoding);
 
         // Parse flags
         frame_header.flags = reader.read_bits(24)? as u64;

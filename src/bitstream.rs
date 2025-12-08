@@ -59,6 +59,39 @@ impl BitstreamReader {
         Ok(result)
     }
 
+    /// Peek at N bits without advancing the position
+    pub fn peek_bits(&self, n: usize) -> JxlResult<u32> {
+        if n == 0 {
+            return Ok(0);
+        }
+        if n > 32 {
+            return Err(JxlError::ParseError(format!("Invalid bit count: {}", n)));
+        }
+        
+        let mut result = 0u32;
+        for i in 0..n {
+            let pos = self.bit_position + i;
+            if pos >= self.data.len() * 8 {
+                return Err(JxlError::NotEnoughData {
+                    expected: (pos + 1 + 7) / 8,
+                    actual: self.data.len(),
+                });
+            }
+            
+            let byte_idx = pos / 8;
+            let bit_idx_lsb = pos % 8;
+            let bit = (self.data[byte_idx] >> bit_idx_lsb) & 1;
+            result |= (bit as u32) << i;
+        }
+        
+        Ok(result)
+    }
+    
+    /// Skip N bits (advance position without returning value)
+    pub fn skip_bits(&mut self, n: usize) {
+        self.bit_position += n;
+    }
+
     /// Read a variable-length integer using j40__u32 encoding
     pub fn read_u32_with_config(
         &mut self,
@@ -99,6 +132,31 @@ impl BitstreamReader {
     /// Get current bit position (for debugging)
     pub fn get_bit_position(&self) -> usize {
         self.bit_position
+    }
+    
+    /// Peek at a byte at a specific position without advancing
+    pub fn peek_byte(&self, byte_pos: usize) -> Option<u8> {
+        self.data.get(byte_pos).copied()
+    }
+    
+    /// Create a sub-reader from the remaining data at current position
+    /// This is used when a decoder needs its own independent reader
+    /// WARNING: The parent reader's position will NOT be updated automatically
+    pub fn create_sub_reader(&self) -> Self {
+        let byte_pos = self.byte_position();
+        let remaining_data = if byte_pos < self.data.len() {
+            self.data[byte_pos..].to_vec()
+        } else {
+            Vec::new()
+        };
+        
+        Self::new(remaining_data)
+    }
+    
+    /// Skip forward by the given number of bytes
+    /// This is used to update position after a sub-reader has consumed data
+    pub fn skip_bytes(&mut self, n: usize) {
+        self.bit_position += n * 8;
     }
 }
 

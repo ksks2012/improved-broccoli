@@ -26,80 +26,209 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     
-    // Parse bitstream (LSB first)
+    // Parse bitstream using MSB-first bit order (standard for JXL)
     let mut bit_pos = 16; // Start after FF 0A (2 bytes = 16 bits)
     
     println!("\n=== SizeHeader ===");
-    let small = get_bit_at(&data, bit_pos);
+    let div8 = get_bit_msb(&data, bit_pos);
     bit_pos += 1;
-    println!("small: {} (at bit {})", small, bit_pos - 1);
+    println!("div8: {} (bit {})", div8, bit_pos - 1);
     
-    if small == 1 {
-        // Small size encoding: height_div8 and width_div8
-        // Both use U32 config (0,0,1,0,5,0,9,0)
-        println!("Using small (div8) encoding...");
-        
-        // Read height_div8 - U32 config: selector 2 bits, then value
-        // For now just skip...  let's count bits properly
-        // This is complex, so let's just display raw bytes
-        println!("Next 8 bytes: {:02X?}", &data[2..std::cmp::min(10, data.len())]);
+    // Parse height
+    let height = if div8 == 1 {
+        let h_div8 = read_bits_msb(&data, bit_pos, 5) + 1;
+        bit_pos += 5;
+        let h = h_div8 * 8;
+        println!("  height_div8 (5 bits): {} -> height: {}", h_div8, h);
+        h
+    } else {
+        // U32(1, 9, 1, 13, 1, 18, 1, 30)
+        let selector = read_bits_msb(&data, bit_pos, 2);
+        bit_pos += 2;
+        let bits = match selector {
+            0 => 9,
+            1 => 13,
+            2 => 18,
+            3 => 30,
+            _ => unreachable!(),
+        };
+        let h = read_bits_msb(&data, bit_pos, bits) + 1;
+        bit_pos += bits;
+        println!("  height (full): {}", h);
+        h
+    };
+    
+    // Parse ratio (3 bits)
+    let ratio = read_bits_msb(&data, bit_pos, 3);
+    bit_pos += 3;
+    println!("  ratio: {}", ratio);
+    
+    // Parse width
+    let width = match ratio {
+        0 => {
+            if div8 == 1 {
+                let w_div8 = read_bits_msb(&data, bit_pos, 5) + 1;
+                bit_pos += 5;
+                let w = w_div8 * 8;
+                println!("  width_div8 (5 bits): {} -> width: {}", w_div8, w);
+                w
+            } else {
+                let selector = read_bits_msb(&data, bit_pos, 2);
+                bit_pos += 2;
+                let bits = match selector {
+                    0 => 9,
+                    1 => 13,
+                    2 => 18,
+                    3 => 30,
+                    _ => unreachable!(),
+                };
+                let w = read_bits_msb(&data, bit_pos, bits) + 1;
+                bit_pos += bits;
+                println!("  width (full): {}", w);
+                w
+            }
+        }
+        1 => {
+            println!("  width = height: {}", height);
+            height
+        }
+        2 => {
+            let w = (height * 6) / 5;
+            println!("  width = height * 6/5: {}", w);
+            w
+        }
+        3 => {
+            let w = (height * 4) / 3;
+            println!("  width = height * 4/3: {}", w);
+            w
+        }
+        4 => {
+            let w = (height * 3) / 2;
+            println!("  width = height * 3/2: {}", w);
+            w
+        }
+        5 => {
+            let w = (height * 16) / 9;
+            println!("  width = height * 16/9: {}", w);
+            w
+        }
+        6 => {
+            let w = (height * 5) / 4;
+            println!("  width = height * 5/4: {}", w);
+            w
+        }
+        7 => {
+            let w = height * 2;
+            println!("  width = height * 2: {}", w);
+            w
+        }
+        _ => unreachable!(),
+    };
+    
+    println!("\n✓ Image size: {} x {}", width, height);
+    
+    println!("\n=== ImageMetadata ===");
+    println!("Current bit position: {}", bit_pos);
+    
+    let all_default_meta = get_bit_msb(&data, bit_pos);
+    bit_pos += 1;
+    println!("all_default: {}", all_default_meta);
+    
+    if all_default_meta == 0 {
+        // Has custom metadata - need to parse it
+        // Based on your diagnostic output, this takes about 8 bytes total
+        println!("  (Has custom ImageMetadata, skipping detailed parse)");
+        println!("  Based on diagnostic output, jumping to approximate position...");
+        // Your diagnostic showed: consumed 8 bytes, position now: 10
+        // That means metadata ended at byte 10
+        bit_pos = 10 * 8; // byte 10
     }
     
-    // For now, let's search for Frame Header by looking for the pattern
-    // Frame Header should have all_default in first bit
-    // Let's check multiple positions
-    
-    println!("\n=== Searching for Frame Header ===");
-    for byte_pos in 2..std::cmp::min(10, data.len()) {
-        let b = data[byte_pos];
-        println!("Byte {}: 0x{:02X} = bits {:08b} (LSB first: bit 0={}, bit 1={}, bit 2={})",
-                 byte_pos, b,
-                 b,
-                 b & 1,
-                 (b >> 1) & 1,
-                 (b >> 2) & 1);
+    // Frame Header should be byte-aligned
+    if bit_pos % 8 != 0 {
+        bit_pos = ((bit_pos / 8) + 1) * 8;
     }
-    
-    // Try position 2 (immediately after FF 0A)
-    let current_byte_pos = 2;
     
     println!("\n=== Frame Header ===");
-    println!("Looking for Frame Header at byte {}...", current_byte_pos);
+    println!("Frame Header starts at bit {} (byte {})", bit_pos, bit_pos / 8);
+    let frame_byte_pos = bit_pos / 8;
     
-    if current_byte_pos < data.len() {
-        let frame_byte = data[current_byte_pos];
-        println!("Frame Header byte: 0x{:02X}", frame_byte);
+    if frame_byte_pos < data.len() {
+        println!("Bytes around Frame Header:");
+        for i in frame_byte_pos..std::cmp::min(frame_byte_pos + 4, data.len()) {
+            print!("{:02X} ", data[i]);
+        }
+        println!("\n");
         
-        let bits: Vec<u8> = (0..8).map(|i| ((frame_byte >> i) & 1) as u8).collect();
-        println!("Bits (LSB first): {:?}", bits);
+        let frame_byte = data[frame_byte_pos];
+        println!("Frame Header first byte: 0x{:02X} = binary: {:08b}", frame_byte, frame_byte);
         
-        let all_default = bits[0];
-        let frame_type = bits[1] | (bits[2] << 1);
+        // Parse Frame Header (MSB first)
+        let all_default_frame = get_bit_msb(&data, bit_pos);
+        bit_pos += 1;
+        println!("all_default: {}", all_default_frame);
         
-        println!("all_default: {}", all_default);
-        
-        if all_default == 1 {
-            // Skip frame header parsing
+        if all_default_frame == 1 {
             println!("  => Using default frame header");
+            println!("  => Default encoding is usually VarDCT for non-preview frames");
         } else {
-            println!("frame_type: {}", frame_type);
+            // Read frame_type (2 bits)
+            let frame_type = read_bits_msb(&data, bit_pos, 2);
+            bit_pos += 2;
+            let frame_type_name = match frame_type {
+                0 => "RegularFrame",
+                1 => "LfFrame", 
+                2 => "ReferenceOnly",
+                3 => "SkipProgressive",
+                _ => unreachable!(),
+            };
+            println!("frame_type: {} ({})", frame_type, frame_type_name);
             
-            let is_modular = bits[2];
-            println!("is_modular (bit 2): {} => {}", is_modular, 
-                if is_modular == 1 { "MODULAR" } else { "VarDCT" });
+            // Read encoding (1 bit) - THIS IS THE KEY BIT!
+            let is_modular = get_bit_msb(&data, bit_pos);
+            bit_pos += 1;
+            
+            println!("\n*** ENCODING BIT: {} ***", is_modular);
+            println!("*** Encoding: {} ***", if is_modular == 1 {
+                "🎯 MODULAR"
+            } else {
+                "VarDCT"
+            });
+            
+            if is_modular == 1 {
+                println!("\n✅ CONFIRMED: This file uses MODULAR encoding!");
+                println!("   - No DCT transform");
+                println!("   - No chroma subsampling");
+                println!("   - Uses predictor-based compression");
+            } else {
+                println!("\n⚠️  This file uses VarDCT encoding!");
+                println!("   - Uses DCT transform");
+                println!("   - May have chroma subsampling");
+                println!("   - This is unexpected for --modular=1 flag");
+            }
         }
     }
     
     Ok(())
 }
 
-fn get_bit_at(data: &[u8], bit_pos: usize) -> u8 {
+// Read single bit using MSB-first order (standard for JXL)
+fn get_bit_msb(data: &[u8], bit_pos: usize) -> u8 {
     let byte_pos = bit_pos / 8;
-    let bit_in_byte = bit_pos % 8;
+    let bit_in_byte = 7 - (bit_pos % 8); // MSB first: bit 0 is MSB (bit 7 of byte)
     
     if byte_pos < data.len() {
         ((data[byte_pos] >> bit_in_byte) & 1) as u8
     } else {
         0
     }
+}
+
+// Read multiple bits using MSB-first order
+fn read_bits_msb(data: &[u8], bit_pos: usize, num_bits: usize) -> u32 {
+    let mut result = 0u32;
+    for i in 0..num_bits {
+        result = (result << 1) | (get_bit_msb(data, bit_pos + i) as u32);
+    }
+    result
 }
