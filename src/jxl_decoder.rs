@@ -263,58 +263,235 @@ impl JxlDecoder {
         let remaining_data = self.data[self.position..].to_vec();
         let mut reader = BitstreamReader::new(remaining_data);
         
-        // Parse the image header
+        // Parse the image header (SizeHeader + start of ImageMetadata)
         println!("DEBUG: Before JxlImageHeader::parse, bit_pos={}", reader.get_bit_position());
         let header = JxlImageHeader::parse(&mut reader)?;
         println!("DEBUG: After JxlImageHeader::parse, bit_pos={}, byte_pos={}, all_default={}", 
                  reader.get_bit_position(), reader.byte_position(), header.all_default);
         
+        let mut xyb_encoded = true;  // default
         let (color_encoding, num_extra_channels) = if header.all_default {
-            // When all_default=1, use default values without parsing
-            // Default: sRGB color space, no extra channels
+            // When all_default=1:
+            // - No extra channels
+            // - xyb_encoded defaults to true  
+            // - Default color encoding (sRGB)
+            println!("DEBUG: all_default=1, using defaults");
             let default_color = ColorEncoding {
                 color_space: 0,  // RGB
                 white_point: 1,  // D65
                 primaries: 1,    // sRGB
                 gamma: 0.0,      // Not used for sRGB
             };
-            println!("DEBUG: Using default color encoding and 0 extra channels (all_default=1)");
-            (default_color, 0)
+            (default_color, 0u32)
         } else {
-            // Parse color encoding and extra channels normally
-            let color_encoding = ColorEncoding::parse(&mut reader)?;
-            println!("DEBUG: After ColorEncoding::parse, bit_pos={}, byte_pos={}", 
-                     reader.get_bit_position(), reader.byte_position());
+            // !all_default path - must follow j40's exact order:
+            // 1. num_extra_channels
+            // 2. extra channel info loop
+            // 3. xyb_encoded
+            // 4. ColourEncoding
+            // 5. ToneMapping (if extra_fields)
+            // 6. extensions
             
-            // Parse number of extra channels (alpha, depth, etc.)
-            let num_extra_channels = reader.read_u32_with_config(0, 0, 1, 0, 2, 4, 1, 12)?;
-            println!("Number of extra channels: {}", num_extra_channels);
-            println!("DEBUG: After num_extra_channels, bit_pos={}, byte_pos={}", 
-                     reader.get_bit_position(), reader.byte_position());
+            // num_extra_channels: U32(0, 0, 1, 0, 2, 4, 1, 12)
+            let num_ec = reader.read_u32_with_config(0, 0, 1, 0, 2, 4, 1, 12)?;
+            println!("[ImageMetadata] num_extra_channels={} at bit {}", num_ec, reader.get_bit_position());
             
             // Parse extra channel info
-            for i in 0..num_extra_channels {
-                // Each extra channel has: all_default flag, type, bit_depth, etc.
-                let all_default = reader.read_bool()?;
-                if !all_default {
-                    // Read extra channel details (simplified - there are more fields in spec)
-                    let _ec_type = reader.read_u32_with_config(0, 0, 1, 0, 2, 4, 1, 8)?;
-                    let _ec_bits = reader.read_u32_with_config(0, 0, 1, 0, 2, 4, 1, 8)?;
-                    // TODO: Parse remaining extra channel fields (dim_shift, name_len, etc.)
+            for i in 0..num_ec {
+                let d_alpha = reader.read_bool()?;
+                println!("  Extra channel {}: d_alpha={} at bit {}", i, d_alpha, reader.get_bit_position());
+                if !d_alpha {
+                    // Full extra channel info
+                    let ec_type = Self::read_enum(&mut reader)?;
+                    println!("    ec_type={}", ec_type);
+                    // bit_depth
+                    let is_float = reader.read_bool()?;
+                    if is_float {
+                        let _bpp = reader.read_u32_with_config(32, 0, 16, 0, 24, 0, 1, 6)?;
+                        let _exp_bits = reader.read_bits(4)?;
+                    } else {
+                        let _bpp = reader.read_u32_with_config(8, 0, 10, 0, 12, 0, 1, 6)?;
+                    }
+                    // dim_shift
+                    let _dim_shift = reader.read_u32_with_config(0, 0, 3, 0, 4, 0, 1, 3)?;
+                    // name_len and name
+                    let name_len = reader.read_u32_with_config(0, 0, 0, 4, 16, 5, 48, 10)?;
+                    println!("    name_len={}", name_len);
+                    // Skip name bytes
+                    for _ in 0..name_len {
+                        reader.read_bits(8)?;
+                    }
+                    // Type-specific fields
+                    match ec_type {
+                        0 => { // ALPHA
+                            let _alpha_assoc = reader.read_bool()?;
+                        }
+                        1 => { // DEPTH
+                        }
+                        2 => { // SPOT_COLOUR
+                            for _ in 0..4 {
+                                reader.read_bits(16)?; // f16
+                            }
+                        }
+                        3 => { // SELECTION_MASK
+                        }
+                        4 => { // BLACK
+                        }
+                        5 => { // CFA
+                            let _cfa = reader.read_u32_with_config(1, 0, 0, 2, 3, 4, 19, 8)?;
+                        }
+                        6 => { // THERMAL
+                        }
+                        15 => { // NON_OPTIONAL
+                        }
+                        16 => { // OPTIONAL
+                        }
+                        _ => {}
+                    }
                 }
-                println!("  Extra channel {} parsed, bit_pos={}", i, reader.get_bit_position());
+                println!("  Extra channel {} done at bit {}", i, reader.get_bit_position());
             }
             
-            (color_encoding, num_extra_channels)
+            // xyb_encoded
+            xyb_encoded = reader.read_bool()?;
+            println!("[ImageMetadata] xyb_encoded={} at bit {}", xyb_encoded, reader.get_bit_position());
+            
+            // ColourEncoding (only parsed here, not separately!)
+            let color_all_default = reader.read_bool()?;
+            println!("[ColourEncoding] all_default={} at bit {}", color_all_default, reader.get_bit_position());
+            
+            let color_encoding = if color_all_default {
+                ColorEncoding {
+                    color_space: 0,  // RGB (sRGB default)
+                    white_point: 1,  // D65
+                    primaries: 1,    // sRGB
+                    gamma: 0.0,
+                }
+            } else {
+                // Full ColourEncoding parsing
+                let want_icc = reader.read_bool()?;
+                let cspace = Self::read_enum(&mut reader)?;
+                println!("[ColourEncoding] want_icc={}, cspace={}", want_icc, cspace);
+                
+                let mut white_point = 1u8;  // D65 default
+                let mut primaries = 1u8;    // sRGB default
+                let mut gamma = 0.0f32;
+                
+                if !want_icc && cspace != 2 {  // Not XYB
+                    // White point enum
+                    let wp = Self::read_enum(&mut reader)?;
+                    println!("[ColourEncoding] white_point={}", wp);
+                    white_point = wp as u8;
+                    if wp == 2 {  // CUSTOM
+                        // Skip custom xy coordinates (2 x u32)
+                        reader.read_bits(32)?;
+                        reader.read_bits(32)?;
+                    }
+                    
+                    // Primaries (if not grayscale)
+                    if cspace != 1 {  // Not grayscale
+                        let pr = Self::read_enum(&mut reader)?;
+                        println!("[ColourEncoding] primaries={}", pr);
+                        primaries = pr as u8;
+                        if pr == 2 {  // CUSTOM
+                            // Skip 3 custom xy coordinates
+                            for _ in 0..6 {
+                                reader.read_bits(32)?;
+                            }
+                        }
+                    }
+                }
+                
+                if !want_icc {
+                    // Transfer function
+                    let have_gamma = reader.read_bool()?;
+                    if have_gamma {
+                        let gamma_bits = reader.read_bits(24)?;
+                        gamma = gamma_bits as f32;
+                    } else {
+                        let _tf = Self::read_enum(&mut reader)?;
+                    }
+                    // Render intent
+                    let _intent = Self::read_enum(&mut reader)?;
+                }
+                
+                ColorEncoding {
+                    color_space: cspace as u8,
+                    white_point,
+                    primaries,
+                    gamma,
+                }
+            };
+            
+            // ToneMapping (if extra_fields was true)
+            if header.extra_fields {
+                let tone_all_default = reader.read_bool()?;
+                println!("[ToneMapping] all_default={} at bit {}", tone_all_default, reader.get_bit_position());
+                if !tone_all_default {
+                    // intensity_target, min_nits, relative_to_max_display, linear_below
+                    reader.read_bits(16)?;  // f16
+                    reader.read_bits(16)?;  // f16
+                    reader.read_bool()?;
+                    reader.read_bits(16)?;  // f16
+                }
+            }
+            
+            // Extensions
+            let extensions = reader.read_bits(64)?;
+            println!("[ImageMetadata] extensions=0x{:016X} at bit {}", extensions, reader.get_bit_position());
+            if extensions != 0 {
+                println!("WARNING: Extensions not fully implemented, skipping...");
+                // For each bit set, read size and skip
+                for i in 0..64 {
+                    if (extensions >> i) & 1 != 0 {
+                        let ext_size = reader.read_bits(64)?;
+                        println!("  Extension {} size={}", i, ext_size);
+                        // Skip ext_size bits
+                        for _ in 0..ext_size {
+                            reader.read_bits(1)?;
+                        }
+                    }
+                }
+            }
+            
+            (color_encoding, num_ec)
         };
         
-        // Align to byte boundary before Frame Header
-        println!("DEBUG: Before alignment, bit_pos={}", reader.get_bit_position());
-        reader.align_to_byte();
-        println!("DEBUG: After alignment, bit_pos={}", reader.get_bit_position());
+        // default_m - ALWAYS read, even for all_default case!
+        // This is OUTSIDE the if block in j40
+        let default_m = reader.read_bool()?;
+        println!("[ImageMetadata] default_m={} at bit {}", default_m, reader.get_bit_position());
         
-        // TODO: Parse ToneMapping and Extensions correctly
-        // For now, we skip them to get to Frame header
+        if !default_m {
+            // Parse OpsinInverseMatrix and other fields
+            if xyb_encoded {
+                println!("  Parsing OpsinInverseMatrix (9 f16 values)...");
+                for _ in 0..9 {
+                    reader.read_bits(16)?;
+                }
+                println!("  Parsing opsin_bias (3 f16 values)...");
+                for _ in 0..3 {
+                    reader.read_bits(16)?;
+                }
+                println!("  Parsing quant_bias (3 f16 values)...");
+                for _ in 0..3 {
+                    reader.read_bits(16)?;
+                }
+                println!("  Parsing quant_bias_num (1 f16 value)...");
+                reader.read_bits(16)?;
+            }
+            // cw_mask
+            let cw_mask = reader.read_bits(3)?;
+            println!("  cw_mask={}", cw_mask);
+            if cw_mask != 0 {
+                println!("WARNING: cw_mask upsampling weights not implemented");
+            }
+        }
+        
+        // Now align to byte boundary before Frame Header
+        println!("DEBUG: Before frame alignment, bit_pos={}", reader.get_bit_position());
+        reader.align_to_byte();
+        println!("DEBUG: After frame alignment, bit_pos={}", reader.get_bit_position());
         
         // Update position
         let bytes_read = reader.byte_position();
@@ -336,6 +513,17 @@ impl JxlDecoder {
         self.color_encoding = Some(color_encoding);
         
         Ok(())
+    }
+    
+    /// Read enum value (variable length encoding)
+    fn read_enum(reader: &mut BitstreamReader) -> JxlResult<u32> {
+        // j40__enum: while (j40__u(st, 1)) ++val
+        // Reads 1 bit at a time, incrementing until we get a 0
+        let mut val = 0u32;
+        while reader.read_bool()? {
+            val += 1;
+        }
+        Ok(val)
     }
     
     /// Read float16 value
