@@ -13,6 +13,7 @@ pub mod vardct_decoder;
 pub mod transform_tree;
 pub mod predictor;
 pub mod minimal_modular_encoder;
+pub mod entropy_code;
 
 pub use jxl_decoder::*;
 pub use error::*;
