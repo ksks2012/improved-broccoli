@@ -425,29 +425,34 @@ impl JxlDecoder {
         }
         
         // Align to byte boundary after permuted flag (and potential permutation data)
-        self.reader.align_to_byte();
+        reader.align_to_byte();
         
         let mut section_sizes = Vec::new();
         
         if nsections == 1 {
             // Single section case
-            let single_size = self.reader.read_u32_with_config(0, 10, 1024, 14, 17408, 22, 4211712, 30)? as usize;
+            let single_size = reader.read_u32_with_config(0, 10, 1024, 14, 17408, 22, 4211712, 30)? as usize;
             section_sizes.push(single_size);
             println!("DEBUG: TOC single_size = {} bytes", single_size);
         } else {
             // Multiple sections case
             for i in 0..nsections {
-                let size = self.reader.read_u32_with_config(0, 10, 1024, 14, 17408, 22, 4211712, 30)? as usize;
+                let size = reader.read_u32_with_config(0, 10, 1024, 14, 17408, 22, 4211712, 30)? as usize;
                 section_sizes.push(size);
                 println!("DEBUG: TOC section[{}] size = {} bytes", i, size);
             }
         }
         
         // Align to byte boundary again - this is where LfGlobal data starts
-        self.reader.align_to_byte();
+        reader.align_to_byte();
         
         println!("DEBUG: After TOC, bit_pos={}, byte_pos={}", 
-                 self.reader.get_bit_position(), self.reader.byte_position());
+                 reader.get_bit_position(), reader.byte_position());
+        
+        // Update self.position to point to LfGlobal data start
+        let lf_global_offset = self.position + reader.byte_position();
+        self.position = lf_global_offset;
+        println!("DEBUG: Updated self.position to {} (LfGlobal start)", self.position);
         
         // Return total size (first section is lf_global)
         Ok(section_sizes.get(0).copied().unwrap_or(0))
@@ -619,6 +624,7 @@ impl JxlDecoder {
             group_size_shift: 1,
             x_qm_scale: 2,
             b_qm_scale: 2,
+            num_passes: 1,
             passes_def: Vec::new(),
             downsample: 1,
             loop_filter: false,
@@ -635,11 +641,11 @@ impl JxlDecoder {
         let pixel_count = (width * height) as usize;
         
         // Check frame encoding to decide decoding path
-        let frame_header = self.frame_header.as_ref().ok_or_else(|| {
-            JxlError::ParseError("Frame header not parsed".to_string())
-        })?;
-        
-        let is_modular = matches!(frame_header.encoding, FrameEncoding::Modular);
+        // Use detect_modular_pattern as more reliable indicator than frame_header.encoding
+        let is_modular = self.detect_modular_pattern() || 
+            self.frame_header.as_ref()
+                .map(|fh| matches!(fh.encoding, FrameEncoding::Modular))
+                .unwrap_or(false);
         
         if is_modular {
             // True Modular encoding - decode from bitstream
