@@ -3,6 +3,7 @@ use crate::bitstream::BitstreamReader;
 use crate::transform_tree::{TransformNode, Transform};
 use crate::predictor::{PredictorSystem, PredictorType};
 use crate::ans_decoder::{AnsDecoder, AnsSymbolTable, AnsState};
+use crate::entropy_code::{CodeSpec, CodeState, parse_code_spec, unpack_signed};
 
 /// Modular image channel
 #[derive(Debug)]
@@ -54,6 +55,176 @@ impl ModularChannel {
     }
 }
 
+/// Channel information for tracking dimensions during transform parsing
+#[derive(Debug, Clone)]
+pub struct ChannelInfo {
+    pub width: usize,
+    pub height: usize,
+    pub hshift: i32,
+    pub vshift: i32,
+}
+
+impl ChannelInfo {
+    pub fn new(width: usize, height: usize) -> Self {
+        Self { width, height, hshift: 0, vshift: 0 }
+    }
+}
+
+/// Weighted Predictor parameters (from WPHeader in j40)
+#[derive(Debug, Clone)]
+pub struct WpParams {
+    pub p1: i32,
+    pub p2: i32,
+    pub p3: [i32; 5],
+    pub w: [i32; 4],
+}
+
+impl Default for WpParams {
+    fn default() -> Self {
+        // Default WP parameters from JXL spec
+        Self {
+            p1: 16,
+            p2: 10,
+            p3: [7, 7, 7, 0, 0],
+            w: [12, 12, 12, 12],
+        }
+    }
+}
+
+/// Weighted Predictor state for a channel
+#[derive(Debug, Clone)]
+pub struct WeightedPredictor {
+    pub width: usize,
+    pub params: WpParams,
+    /// Error history: errors[y % 2][x] = [err0, err1, err2, err3, true_err]
+    pub errors: Vec<Vec<[i32; 5]>>,
+    /// Current predictions for 5 predictors
+    pub pred: [i32; 5],
+    /// True error values for neighbors
+    pub trueerrw: i32,
+    pub trueerrn: i32,
+    pub trueerrnw: i32,
+    pub trueerrne: i32,
+}
+
+impl WeightedPredictor {
+    pub fn new(width: usize, params: WpParams) -> Self {
+        // Two rows of error history (current and previous)
+        let errors = vec![vec![[0i32; 5]; width]; 2];
+        Self {
+            width,
+            params,
+            errors,
+            pred: [0; 5],
+            trueerrw: 0,
+            trueerrn: 0,
+            trueerrnw: 0,
+            trueerrne: 0,
+        }
+    }
+    
+    /// Compute weighted predictor before prediction
+    /// This sets up trueerr values and predictions
+    pub fn before_predict(&mut self, x: usize, y: usize, w: i32, n: i32, nw: i32, ne: i32, nn: i32) {
+        let err = &self.errors[y & 1];
+        let nerr = &self.errors[(y + 1) & 1];
+        
+        let zero = [0i32; 5];
+        
+        // Get error arrays from neighbors
+        let errw = if x > 0 { &err[x - 1] } else { &zero };
+        let errn = if y > 0 { &nerr[x] } else { &zero };
+        let errnw = if x > 0 && y > 0 { &nerr[x - 1] } else { errn };
+        let errne = if x + 1 < self.width && y > 0 { &nerr[x + 1] } else { errn };
+        let errww = if x > 1 { &err[x - 2] } else { &zero };
+        let errw2 = if x + 1 < self.width { &zero } else { errw };
+        
+        // Get true errors from neighbors
+        self.trueerrw = if x > 0 { err[x - 1][4] } else { 0 };
+        self.trueerrn = if y > 0 { nerr[x][4] } else { 0 };
+        self.trueerrnw = if x > 0 && y > 0 { nerr[x - 1][4] } else { self.trueerrn };
+        self.trueerrne = if x + 1 < self.width && y > 0 { nerr[x + 1][4] } else { self.trueerrn };
+        
+        // Calculate predictions (shifted by 3 bits, i.e., *8)
+        self.pred[0] = (w + ne - n) * 8;
+        self.pred[1] = n * 8 - (((self.trueerrw + self.trueerrn + self.trueerrne) * self.params.p1) >> 5);
+        self.pred[2] = w * 8 - (((self.trueerrw + self.trueerrn + self.trueerrnw) * self.params.p2) >> 5);
+        self.pred[3] = n * 8 - (
+            (self.trueerrnw * self.params.p3[0] + self.trueerrn * self.params.p3[1] +
+             self.trueerrne * self.params.p3[2] + (nn - n) * 8 * self.params.p3[3] +
+             (nw - w) * 8 * self.params.p3[4]) >> 5
+        );
+        
+        // Calculate weighted sum for pred[4]
+        // Using lookup table approximation for division
+        let mut w_weights = [0i32; 4];
+        let mut wsum = 0i32;
+        let mut sum = 0i64;
+        
+        for i in 0..4 {
+            let errsum = errn[i] + errw[i] + errnw[i] + errww[i] + errne[i] + errw2[i];
+            let shift = ((errsum + 1) as u32).leading_zeros() as i32;
+            let shift = (32 - shift - 5).max(0);
+            // Simplified weight calculation
+            w_weights[i] = 4 + ((self.params.w[i] as i64 * 16777216 / (((errsum >> shift) + 1) as i64)) >> shift) as i32;
+        }
+        
+        let logw = ((w_weights[0] + w_weights[1] + w_weights[2] + w_weights[3]) as u32).leading_zeros() as i32;
+        let logw = 32 - logw - 4;
+        
+        for i in 0..4 {
+            w_weights[i] >>= logw.max(0);
+            wsum += w_weights[i];
+            sum += (self.pred[i] as i64) * (w_weights[i] as i64);
+        }
+        
+        if wsum > 0 {
+            self.pred[4] = ((sum + (wsum as i64 / 2) - 1) * 16777216 / (wsum as i64 - 1) / 16777216) as i32;
+        } else {
+            self.pred[4] = 0;
+        }
+        
+        // Clamp pred[4] if errors have same sign
+        if (self.trueerrn ^ self.trueerrw) | (self.trueerrn ^ self.trueerrnw) <= 0 {
+            let lo = w.min(n.min(ne)) * 8;
+            let hi = w.max(n.max(ne)) * 8;
+            self.pred[4] = self.pred[4].max(lo).min(hi);
+        }
+    }
+    
+    /// Update error history after decoding a pixel
+    pub fn after_predict(&mut self, x: usize, y: usize, val: i32) {
+        let err = &mut self.errors[y & 1][x];
+        for i in 0..4 {
+            err[i] = ((self.pred[i] - val * 8).abs() + 3) >> 3;
+        }
+        err[4] = self.pred[4] - val * 8;  // Signed difference for true error
+    }
+    
+    /// Get max_error (property 15) - the trueerr with largest absolute value
+    pub fn max_error(&self) -> i32 {
+        let mut val = self.trueerrw;
+        if val.abs() < self.trueerrn.abs() { val = self.trueerrn; }
+        if val.abs() < self.trueerrnw.abs() { val = self.trueerrnw; }
+        if val.abs() < self.trueerrne.abs() { val = self.trueerrne; }
+        val
+    }
+    
+    /// Reset WP state for a new channel
+    pub fn reset(&mut self) {
+        for row in &mut self.errors {
+            for errs in row {
+                *errs = [0; 5];
+            }
+        }
+        self.pred = [0; 5];
+        self.trueerrw = 0;
+        self.trueerrn = 0;
+        self.trueerrnw = 0;
+        self.trueerrne = 0;
+    }
+}
+
 /// Modular transform types (following j40 specification)
 #[derive(Debug, Clone)]
 pub enum ModularTransform {
@@ -89,11 +260,15 @@ pub struct ModularDecoder {
     ma_tree: Vec<MaTreeNode>,
     predictors: Vec<PredictorSystem>,
     ans_decoder: AnsDecoder,
+    coeff_code_spec: Option<CodeSpec>,  // CodeSpec for pixel/coefficient decoding
     bit_depth: u8,
     orig_width: u32,
     orig_height: u32,
     wp_padded: u32,
     hp_padded: u32,
+    nb_meta_channels: usize,  // Number of meta channels (from transform parsing)
+    group_size_shift: u32,    // Group size shift (default 8 for 256x256)
+    channel_info: Vec<ChannelInfo>,  // Channel dimensions after transform parsing
 }
 
 impl ModularDecoder {
@@ -107,11 +282,15 @@ impl ModularDecoder {
             ma_tree: Vec::new(),
             predictors: Vec::new(),
             ans_decoder: AnsDecoder::new(),
+            coeff_code_spec: None,
             bit_depth,
             orig_width: width,
             orig_height: height,
             wp_padded: width,
             hp_padded: height,
+            nb_meta_channels: 0,
+            group_size_shift: 8,  // Default 256x256 groups
+            channel_info: Vec::new(),
         }
     }
     
@@ -119,6 +298,11 @@ impl ModularDecoder {
     pub fn set_padded_dimensions(&mut self, wp_padded: u32, hp_padded: u32) {
         self.wp_padded = wp_padded;
         self.hp_padded = hp_padded;
+    }
+    
+    /// Set group size shift
+    pub fn set_group_size_shift(&mut self, shift: u32) {
+        self.group_size_shift = shift;
     }
     
     /// Parse LfGlobal prefix before Modular header (following j40 specification)
@@ -149,60 +333,170 @@ impl ModularDecoder {
         
         if global_tree_present {
             println!("Parsing global tree...");
-            // Parse the global tree - this is complex
-            // For now, we'll skip it by noting we need to implement tree parsing
-            self.skip_global_tree(reader)?;
+            // Parse the global tree with full entropy decoding
+            self.parse_global_tree(reader)?;
         }
         
         println!("LfGlobal prefix parsed, bit_pos now {}", reader.get_bit_position());
         Ok(())
     }
     
-    /// Skip global tree parsing (placeholder - needs full implementation)
-    fn skip_global_tree(&mut self, reader: &mut BitstreamReader) -> JxlResult<()> {
-        // The global tree uses j40__tree which reads entropy-coded data
-        // This requires:
-        // 1. Reading first code_spec (tree structure encoding)
-        // 2. Decoding tree nodes using entropy codes (~2000+ nodes for this file)
-        // 3. Reading second code_spec (coefficient encoding)
-        //
-        // From j40 debug: global tree starts at bit 282, ends at bit 35158
-        // That's 34876 bits of tree data!
-        //
-        // For now, parse the first code_spec to understand the structure
-        println!("WARNING: Global tree present - parsing code_spec only (tree nodes skipped)");
+    /// Parse global tree with full entropy decoding (following j40__tree)
+    fn parse_global_tree(&mut self, reader: &mut BitstreamReader) -> JxlResult<()> {
+        const MAX_TREE_SIZE: i32 = 1 << 26;
         
-        // Parse MA tree code_spec (this is the first code_spec)
-        self.parse_ma_tree(reader)?;
+        println!("=== Starting global tree parsing at bit_pos {} ===", reader.get_bit_position());
         
-        // At this point we've only parsed the first code_spec
-        // The tree nodes would be decoded next, followed by second code_spec
-        // 
-        // HACK: For kodim23_d0_m1.jxl, we know the global tree ends at bit 35158 (global)
-        // which is 35158 - 280 = 34878 in the sub-reader
-        let current_pos = reader.get_bit_position();
-        let expected_end = 34878; // Known from j40 debug output
+        // Parse first code_spec for tree parsing (6 distributions for tree structure)
+        let tree_code_spec = parse_code_spec(reader, 6)?;
+        println!("Tree code_spec parsed: {} clusters, log_alpha_size={}", 
+                 tree_code_spec.num_clusters, tree_code_spec.log_alpha_size);
         
-        if current_pos < expected_end {
-            let skip_bits = expected_end - current_pos;
-            println!("HACK: Skipping {} bits to reach global tree end at bit {}", skip_bits, expected_end);
-            reader.skip_bits(skip_bits);
+        // Create code state for decoding
+        let mut code = CodeState::new(&tree_code_spec);
+        
+        // Initialize tree data structures
+        let mut tree = Vec::with_capacity(8);
+        let mut tree_idx = 0i32;
+        let mut ctx_id = 0i32;
+        let mut nodes_left = 1i32;
+        let mut depth = 0i32;
+        let mut nodes_upto_this_depth = 1i32;
+        
+        println!("Starting tree node decoding loop...");
+        println!("  LZ77: enabled={}, min_symbol={}", tree_code_spec.lz77_enabled, tree_code_spec.min_symbol);
+        println!("  num_clusters={}, cluster_map={:?}", tree_code_spec.num_clusters, tree_code_spec.cluster_map);
+        println!("  use_prefix_code={}", tree_code_spec.use_prefix_code);
+        
+        // Depth-first, left-to-right tree decoding
+        while nodes_left > 0 {
+            nodes_left -= 1;
+            
+            if tree_idx < 10 || tree_idx % 500 == 0 || nodes_left == 0 {
+                println!("[Tree] tree_idx={}, nodes_left={}, bit_pos={}", 
+                         tree_idx, nodes_left, reader.get_bit_position());
+            }
+            
+            // Check tree depth
+            if tree_idx == nodes_upto_this_depth {
+                depth += 1;
+                if depth > 2048 {
+                    return Err(JxlError::ParseError("Tree depth limit exceeded".to_string()));
+                }
+                nodes_upto_this_depth += nodes_left + 1;
+            }
+            
+            // Decode property (ctx=1)
+            if tree_idx == 0 {
+                println!("  [Debug] About to decode prop from ctx=1, cluster_map[1]={}", tree_code_spec.cluster_map[1]);
+                println!("  [Debug] ANS state before: 0x{:x}", code.ans_state);
+            }
+            let prop = code.decode(reader, 1)?;
+            if tree_idx == 0 {
+                println!("  [Debug] ANS state after: 0x{:x}", code.ans_state);
+            }
+            
+            if tree_idx < 80 || tree_idx % 100 == 0 {
+                println!("  [TreeNode {}] prop={} (bit_pos now {})", tree_idx, prop, reader.get_bit_position());
+            }
+            
+            // Create node
+            let node = if prop > 0 {
+                // Branch node
+                let value = unpack_signed(code.decode(reader, 0)?);
+                let leftoff = nodes_left + 1;
+                nodes_left += 1;
+                let rightoff = nodes_left + 1;
+                nodes_left += 1;
+                
+                if tree_idx < 80 || tree_idx % 100 == 0 || (tree_idx >= 2240 && tree_idx <= 2290) {
+                    println!("    Branch[{}]: value={}, leftoff={}, rightoff={}, nodes_left now {}", 
+                             tree_idx, value, leftoff, rightoff, nodes_left);
+                }
+                
+                MaTreeNode {
+                    property: -prop,  // Negative property for branch
+                    value,
+                    left_child: leftoff,
+                    right_child: rightoff,
+                    predictor: 0,
+                    offset: 0,
+                    multiplier: 1,
+                }
+            } else {
+                // Leaf node
+                let bp_before_pred = reader.get_bit_position();
+                let predictor = code.decode(reader, 2)? as u8;
+                let bp_after_pred = reader.get_bit_position();
+                let offset = unpack_signed(code.decode(reader, 3)?);
+                let bp_after_offset = reader.get_bit_position();
+                
+                // Debug: show ANS state before shift decode
+                if tree_idx >= 54 && tree_idx < 60 {
+                    println!("    [SHIFT DEBUG] tree_idx={}, about to decode shift from ctx=4", tree_idx);
+                    println!("    [SHIFT DEBUG] ANS state before: 0x{:08x}", code.ans_state);
+                    code.debug_next_decode = true;
+                }
+                let shift = code.decode(reader, 4)?;
+                code.debug_next_decode = false;
+                if tree_idx >= 54 && tree_idx < 60 {
+                    println!("    [SHIFT DEBUG] decoded shift={}, ANS state after: 0x{:08x}", shift, code.ans_state);
+                }
+                let bp_after_shift = reader.get_bit_position();
+                
+                if tree_idx < 80 || tree_idx % 100 == 0 {
+                    println!("    Leaf: predictor={}, offset={}, shift={}", predictor, offset, shift);
+                    println!("    Leaf bit_pos: before_pred={}, after_pred={}, after_offset={}, after_shift={}", 
+                             bp_before_pred, bp_after_pred, bp_after_offset, bp_after_shift);
+                }
+                
+                if shift >= 31 {
+                    println!("ERROR: Tree shift {} >= 31 at tree_idx={}, bit_pos={}", shift, tree_idx, reader.get_bit_position());
+                    return Err(JxlError::ParseError(format!("Tree shift {} >= 31", shift)));
+                }
+                
+                let val = code.decode(reader, 5)?;
+                let multiplier = ((val + 1) as u32) << shift;
+                
+                let node = MaTreeNode {
+                    property: 0,  // Leaf node indicator
+                    value: ctx_id,  // Context ID for this leaf
+                    left_child: -1,
+                    right_child: -1,
+                    predictor,
+                    offset,
+                    multiplier,
+                };
+                
+                ctx_id += 1;
+                node
+            };
+            
+            tree.push(node);
+            tree_idx += 1;
+            
+            // Check tree size limit
+            if tree_idx + nodes_left > MAX_TREE_SIZE {
+                return Err(JxlError::ParseError("Tree size limit exceeded".to_string()));
+            }
         }
         
-        println!("Global tree skipped (HACK), now at bit_pos={}", reader.get_bit_position());
+        println!("Tree decoding complete: {} nodes, {} leaf contexts", tree_idx, ctx_id);
+        println!("Tree parsing ended at bit_pos {}", reader.get_bit_position());
         
-        // Create a simple default tree (single leaf node with weighted predictor)
-        self.ma_tree = vec![MaTreeNode {
-            property: -1,  // Leaf node  
-            value: 0,
-            left_child: -1,
-            right_child: -1,
-            predictor: 0,  // Weighted predictor (default)
-            offset: 0,
-            multiplier: 1,
-        }];
+        // Verify ANS final state
+        code.verify_final_state()?;
         
-        println!("LfGlobal prefix parsed (simplified - tree nodes not decoded)");
+        self.ma_tree = tree;
+        
+        // Now parse second code_spec for coefficient decoding (ctx_id distributions)
+        println!("Parsing second code_spec for {} contexts...", ctx_id);
+        let coeff_code_spec = parse_code_spec(reader, ctx_id as usize)?;
+        println!("Second code_spec parsed, bit_pos now {}", reader.get_bit_position());
+        
+        // Store the coefficient code spec for pixel decoding
+        self.coeff_code_spec = Some(coeff_code_spec);
+        
         Ok(())
     }
     
@@ -257,6 +551,13 @@ impl ModularDecoder {
                      reader.peek_byte(byte_pos + 7).unwrap_or(0));
         }
         
+        // Initialize channel_info list with initial channel dimensions
+        // Start with num_channels, all at original size
+        let mut channel_info: Vec<ChannelInfo> = (0..self.channels)
+            .map(|_| ChannelInfo::new(self.width as usize, self.height as usize))
+            .collect();
+        let mut nb_meta_channels = 0usize;
+        
         // Parse each transform according to j40 specification
         let mut transforms = Vec::new();
         let mut i = 0;
@@ -286,25 +587,71 @@ impl ModularDecoder {
                     // Palette
                     println!("  Parsing Palette at bit_pos {}", reader.get_bit_position());
                     // begin_c: j40__u32(st, 0, 3, 8, 6, 72, 10, 1096, 13)
-                    let begin_c = reader.read_u32_with_config(0, 3, 8, 6, 72, 10, 1096, 13)?;
+                    let begin_c = reader.read_u32_with_config(0, 3, 8, 6, 72, 10, 1096, 13)? as usize;
                     println!("    begin_c={} (bit_pos now {})", begin_c, reader.get_bit_position());
                     // num_c: j40__u32(st, 1, 0, 3, 0, 4, 0, 1, 13)
-                    let num_c = reader.read_u32_with_config(1, 0, 3, 0, 4, 0, 1, 13)?;
+                    let num_c = reader.read_u32_with_config(1, 0, 3, 0, 4, 0, 1, 13)? as usize;
                     println!("    num_c={} (bit_pos now {})", num_c, reader.get_bit_position());
                     // nb_colours: j40__u32(st, 0, 8, 256, 10, 1280, 12, 5376, 16)
-                    let nb_colours = reader.read_u32_with_config(0, 8, 256, 10, 1280, 12, 5376, 16)?;
+                    let nb_colours = reader.read_u32_with_config(0, 8, 256, 10, 1280, 12, 5376, 16)? as usize;
                     println!("    nb_colours={} (bit_pos now {})", nb_colours, reader.get_bit_position());
                     // nb_deltas: j40__u32(st, 0, 0, 1, 8, 257, 10, 1281, 16)
-                    let nb_deltas = reader.read_u32_with_config(0, 0, 1, 8, 257, 10, 1281, 16)?;
+                    let nb_deltas = reader.read_u32_with_config(0, 0, 1, 8, 257, 10, 1281, 16)? as usize;
                     println!("    nb_deltas={} (bit_pos now {})", nb_deltas, reader.get_bit_position());
                     // d_pred: 4 bits
                     let d_pred = reader.read_bits(4)? as u8;
                     println!("  Palette: begin_c={}, num_c={}, nb_colours={}, nb_deltas={}, d_pred={}", 
-                             begin_c, num_c, nb_colours, nb_deltas, d_pred);                    transforms.push(ModularTransform::Palette {
-                        begin_c: begin_c as usize,
-                        num_c: num_c as usize,
-                        nb_colours: nb_colours as usize,
-                        nb_deltas: nb_deltas as usize,
+                             begin_c, num_c, nb_colours, nb_deltas, d_pred);
+                    
+                    // Update channel_info according to j40 logic:
+                    // Palette transform rearranges channels:
+                    // - Saves input = channel[begin_c]
+                    // - Shifts channels [0, begin_c) to [1, begin_c+1)
+                    // - Shifts channels [end_c, num_channels) to [begin_c+2, ...]
+                    // - channel[0] = palette (nb_colours × num_c)
+                    // - channel[begin_c+1] = input (unchanged)
+                    let end_c = begin_c + num_c;
+                    let input = channel_info[begin_c].clone();
+                    
+                    // Insert new palette channel at position 0
+                    let palette_channel = ChannelInfo {
+                        width: nb_colours,
+                        height: num_c,
+                        hshift: 0,
+                        vshift: -1,  // Meta channel marker
+                    };
+                    
+                    // Rearrange channels
+                    let mut new_channels = Vec::with_capacity(channel_info.len() + 2 - num_c);
+                    new_channels.push(palette_channel);  // channel[0] = palette
+                    for j in 0..begin_c {
+                        new_channels.push(channel_info[j].clone());  // shift [0, begin_c) to [1, begin_c+1)
+                    }
+                    new_channels.push(input);  // channel[begin_c+1] = original input
+                    for j in end_c..channel_info.len() {
+                        new_channels.push(channel_info[j].clone());  // shift remaining channels
+                    }
+                    channel_info = new_channels;
+                    
+                    // Update nb_meta_channels
+                    if begin_c < nb_meta_channels {
+                        // num_c meta channels -> 2 meta channels
+                        nb_meta_channels += 2 - num_c;
+                    } else {
+                        // num_c color channels -> 1 meta channel + 1 color channel
+                        nb_meta_channels += 1;
+                    }
+                    
+                    println!("  After Palette: num_channels={}, nb_meta_channels={}", channel_info.len(), nb_meta_channels);
+                    for (j, ch) in channel_info.iter().enumerate().take(5) {
+                        println!("    channel[{}]: {}×{}", j, ch.width, ch.height);
+                    }
+                    
+                    transforms.push(ModularTransform::Palette {
+                        begin_c,
+                        num_c,
+                        nb_colours,
+                        nb_deltas,
                         d_pred,
                     });
                 }
@@ -346,6 +693,16 @@ impl ModularDecoder {
         }
         
         println!("Parsed {} transforms total", transforms.len());
+        
+        // Save calculated channel_info and nb_meta_channels
+        println!("Final channel_info after transforms:");
+        for (j, ch) in channel_info.iter().enumerate() {
+            println!("  channel[{}]: {}×{}", j, ch.width, ch.height);
+        }
+        println!("Final nb_meta_channels: {}", nb_meta_channels);
+        
+        self.nb_meta_channels = nb_meta_channels;
+        self.channel_info = channel_info;
         self.transforms = transforms;
         
         // Now parse the MA tree (if not using global tree)
@@ -836,48 +1193,118 @@ impl ModularDecoder {
     fn decode_all_groups(&mut self, reader: &mut BitstreamReader) -> JxlResult<Vec<ModularChannel>> {
         let mut channels = Vec::new();
         
-        for channel_idx in 0..self.channels as usize {
-            println!("Decoding Group coefficients for channel {}", channel_idx);
-            
-            // Create channel with padded dimensions
-            let mut channel = ModularChannel::new(self.wp_padded as usize, self.hp_padded as usize);
-            
-            // Decode residuals and apply inverse prediction
-            match self.decode_channel_coefficients(reader, channel_idx) {
-                Ok(coefficients) => {
-                    println!("Successfully decoded {} coefficients for channel {}", coefficients.len(), channel_idx);
-                    channel.data = coefficients;
+        // Check if we have the coefficient CodeSpec
+        let coeff_code_spec = match &self.coeff_code_spec {
+            Some(spec) => spec.clone(),
+            None => {
+                println!("WARNING: No coefficient CodeSpec, using placeholder data for all channels");
+                for channel_idx in 0..self.channels as usize {
+                    let mut channel = ModularChannel::new(self.wp_padded as usize, self.hp_padded as usize);
+                    channel.data = self.generate_placeholder_channel(channel_idx, channel.width * channel.height)?;
                     channels.push(channel);
                 }
-                Err(e) => {
-                    println!("Failed to decode coefficients for channel {}: {}, using fallback", channel_idx, e);
-                    return Err(e);
-                }
+                return Ok(channels);
             }
+        };
+        
+        println!("=== decode_all_groups ===");
+        println!("  Image size: {}×{}", self.width, self.height);
+        println!("  Group size shift: {} (group size: {})", self.group_size_shift, 1 << self.group_size_shift);
+        println!("  Total channels (after transforms): {}", self.channel_info.len());
+        println!("  nb_meta_channels: {}", self.nb_meta_channels);
+        println!("  MA tree has {} nodes", self.ma_tree.len());
+        println!("  Coefficient CodeSpec has {} clusters", coeff_code_spec.num_clusters);
+        
+        // Print channel info
+        for (i, ch_info) in self.channel_info.iter().enumerate() {
+            println!("  channel_info[{}]: {}×{}", i, ch_info.width, ch_info.height);
         }
         
+        // Determine how many channels to decode in LfGlobal section
+        let group_size = 1u32 << self.group_size_shift;
+        let num_channels = self.channel_info.len();
+        let num_gm_channels = if self.width <= group_size && self.height <= group_size {
+            // Single group: decode all channels in LfGlobal
+            num_channels
+        } else {
+            // Multiple groups: only decode meta channels in LfGlobal
+            self.nb_meta_channels
+        };
+        
+        println!("  Decoding {} channels in LfGlobal (out of {} total)", num_gm_channels, num_channels);
+        
+        // Create CodeState for entropy decoding
+        let mut code_state = CodeState::new(&coeff_code_spec);
+        // Note: ANS state will be initialized on first decode() call
+        println!("  Starting decoding at bit_pos {}", reader.get_bit_position());
+        
+        // First, create all channel structures with correct sizes
+        for channel_idx in 0..num_channels {
+            let ch_info = &self.channel_info[channel_idx];
+            let channel = ModularChannel::new(ch_info.width, ch_info.height);
+            channels.push(channel);
+            println!("  Created channel {} with size {}×{}", channel_idx, ch_info.width, ch_info.height);
+        }
+        
+        // Decode channels that should be in LfGlobal
+        for channel_idx in 0..num_gm_channels {
+            let ch_info = &self.channel_info[channel_idx];
+            println!("  Decoding channel {} ({}×{}) from LfGlobal...", channel_idx, ch_info.width, ch_info.height);
+            let channel_data = self.decode_channel_with_state(reader, &mut code_state, &coeff_code_spec, channel_idx)?;
+            
+            // Debug: print first few values of meta channels
+            if channel_idx < 2 {
+                println!("    Meta channel {} first 10 values: {:?}", channel_idx, &channel_data[..10.min(channel_data.len())]);
+            }
+            
+            channels[channel_idx].data = channel_data;
+        }
+        
+        // For remaining channels (if any), use placeholder data for now
+        // These should be decoded from LfGroup/PassGroup sections
+        for channel_idx in num_gm_channels..num_channels {
+            println!("  Channel {} needs LfGroup decoding (using placeholder)", channel_idx);
+            let pixel_count = channels[channel_idx].width * channels[channel_idx].height;
+            channels[channel_idx].data = self.generate_placeholder_channel(channel_idx, pixel_count)?;
+        }
+        
+        println!("decode_all_groups completed at bit_pos {}", reader.get_bit_position());
         Ok(channels)
     }
     
     /// Step 2: Apply inverse transforms in correct order (Palette → RCT → Squeeze)
     fn apply_inverse_transforms_ordered(&mut self, channels: &mut Vec<ModularChannel>) -> JxlResult<()> {
-        if let Some(transform_tree) = &self.transform_tree {
-            println!("Applying inverse transforms in reverse order...");
+        if self.transforms.is_empty() {
+            println!("No transforms to apply");
+            return Ok(());
+        }
+        
+        println!("Applying {} inverse transforms in reverse order...", self.transforms.len());
+        
+        // Apply transforms in reverse order
+        for (i, transform) in self.transforms.iter().rev().enumerate() {
+            println!("Applying inverse transform {}: {:?}", i, transform);
             
-            // Apply transforms in reverse order: Palette → RCT → Squeeze (opposite of forward)
-            self.apply_transform_tree_inverse(transform_tree, channels)?;
-            
-            // Check dimensions after each Unsqueeze operation
-            for (i, channel) in channels.iter().enumerate() {
-                if channel.has_original_size(self.orig_width as usize, self.orig_height as usize) {
-                    println!("Channel {} reached original size after unsqueezing", i);
-                } else {
-                    println!("Channel {} size: {}×{}, target: {}×{}", 
-                        i, channel.width, channel.height, self.orig_width, self.orig_height);
+            match transform {
+                ModularTransform::Rct { begin_c, rct_type } => {
+                    self.apply_inverse_rct(channels, *begin_c, *rct_type)?;
+                }
+                ModularTransform::Palette { begin_c, num_c, nb_colours, nb_deltas, d_pred } => {
+                    self.apply_inverse_palette(channels, *begin_c, *num_c, *nb_colours, *nb_deltas, *d_pred)?;
+                }
+                ModularTransform::Squeeze { horizontal, in_place, begin_c, num_c } => {
+                    self.apply_inverse_squeeze_explicit(channels, *horizontal, *in_place, *begin_c, *num_c)?;
+                }
+                ModularTransform::SqueezeImplicit => {
+                    self.apply_inverse_squeeze_implicit(channels)?;
                 }
             }
-        } else {
-            println!("No transform tree, skipping inverse transforms");
+            
+            // Check dimensions after each operation
+            for (j, channel) in channels.iter().enumerate() {
+                println!("  Channel {} size after inverse transform: {}×{}", 
+                    j, channel.width, channel.height);
+            }
         }
         
         Ok(())
@@ -948,88 +1375,337 @@ impl ModularDecoder {
         Ok(rgb_data)
     }
     
-    /// Decode coefficients for a single channel using ANS and predictors
+    /// Decode coefficients for a single channel using MA tree and CodeSpec
     fn decode_channel_coefficients(&mut self, reader: &mut BitstreamReader, channel_idx: usize) -> JxlResult<Vec<i32>> {
-        let pixel_count = (self.width * self.height) as usize;
-        let mut residuals = Vec::with_capacity(pixel_count);
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let pixel_count = width * height;
         
-        // Check if we have distributions for ANS decoding
-        if self.ans_decoder.distributions.is_empty() {
-            // No distributions available - this means we couldn't parse the full entropy coding
-            // Generate placeholder data based on the channel index
-            // This is a temporary workaround until full tree+entropy decoding is implemented
-            println!("WARNING: No ANS distributions available for channel {}, using placeholder data", channel_idx);
-            
-            // Generate simple placeholder values
-            // This will produce a visible pattern to indicate decoding isn't working
-            for i in 0..pixel_count {
-                let x = i % self.width as usize;
-                let y = i / self.width as usize;
-                // Create a gradient pattern so we can see something
-                let val = match channel_idx {
-                    0 => (x * 255 / (self.width as usize).max(1)) as i32,  // R: horizontal gradient
-                    1 => (y * 255 / (self.height as usize).max(1)) as i32, // G: vertical gradient
-                    _ => 128, // B: constant
-                };
-                residuals.push(val);
+        // Check if we have the coefficient CodeSpec
+        let coeff_code_spec = match &self.coeff_code_spec {
+            Some(spec) => spec.clone(),  // Clone to avoid borrow issues
+            None => {
+                println!("WARNING: No coefficient CodeSpec for channel {}, using placeholder data", channel_idx);
+                return self.generate_placeholder_channel(channel_idx, pixel_count);
             }
-            return Ok(residuals);
+        };
+        
+        // Check if we have MA tree
+        if self.ma_tree.is_empty() {
+            println!("WARNING: No MA tree for channel {}, using placeholder data", channel_idx);
+            return self.generate_placeholder_channel(channel_idx, pixel_count);
         }
         
-        // Initialize ANS state for this channel
-        let mut ans_state = AnsState::new(10); // Use 1024 table size
-        ans_state.init_from_stream(reader)?;
+        println!("Decoding channel {} using MA tree ({} nodes) and CodeSpec ({} clusters)", 
+            channel_idx, self.ma_tree.len(), coeff_code_spec.num_clusters);
         
-        // Try to decode residuals using ANS
-        let mut decoded_count = 0;
-        let max_attempts = pixel_count.min(1000); // Limit attempts to avoid infinite loops
+        // Initialize code state
+        let mut code_state = CodeState::new(&coeff_code_spec);
         
-        while decoded_count < max_attempts && ans_state.can_decode() {
-            // Get distribution (use first distribution if available, otherwise skip)
-            let distribution = if !self.ans_decoder.distributions.is_empty() {
-                &self.ans_decoder.distributions[0]
-            } else {
-                // No distributions available, skip ANS decoding
-                return Ok(residuals);
-            };
-            
-            match ans_state.decode_symbol(reader, distribution) {
-                Ok(symbol) => {
-                    // Convert symbol to signed residual
-                    let residual = if symbol & 1 == 0 {
-                        (symbol >> 1) as i32
-                    } else {
-                        -((symbol >> 1) as i32) - 1
+        // Initialize ANS state from bitstream (only once per channel group, not per pixel)
+        if !coeff_code_spec.use_prefix_code {
+            code_state.ans_state = reader.read_bits(32)?;
+            println!("  ANS init state: 0x{:08x}", code_state.ans_state);
+        }
+        
+        // Decode pixels using MA tree + prediction
+        let mut pixels = vec![0i32; pixel_count];
+        let dist_mult = width.max(1) as i32;  // Distance multiplier for LZ77
+        
+        for y in 0..height {
+            for x in 0..width {
+                // Get neighboring pixels for prediction and property testing
+                // Following j40 init_neighbors logic
+                let w = if x > 0 { 
+                    pixels[y * width + x - 1] 
+                } else if y > 0 { 
+                    pixels[(y - 1) * width + x] 
+                } else { 
+                    0 
+                };
+                let n = if y > 0 { pixels[(y - 1) * width + x] } else { w };
+                let nw = if x > 0 && y > 0 { pixels[(y - 1) * width + x - 1] } else { w };
+                let ne = if x < width - 1 && y > 0 { pixels[(y - 1) * width + x + 1] } else { n };
+                let nn = if y > 1 { pixels[(y - 2) * width + x] } else { n };
+                let ww = if x > 1 { pixels[y * width + x - 2] } else { w };
+                let nww = if x > 1 && y > 0 { pixels[(y - 1) * width + x - 2] } else { ww };
+                
+                // Traverse MA tree to find leaf node
+                let mut node_idx = 0;
+                while node_idx < self.ma_tree.len() {
+                    let node = &self.ma_tree[node_idx];
+                    
+                    // j40: while (n->branch.prop < 0) - branch nodes have negative prop
+                    // Our storage: branch nodes have property < 0 (we stored -prop)
+                    if node.property >= 0 {
+                        // This is a leaf node (property = 0 or positive means leaf)
+                        break;
+                    }
+                    
+                    // Get the actual property id using bitwise NOT (same as j40)
+                    // j40 stores: n->branch.prop = -prop
+                    // j40 retrieves: ~n->branch.prop = ~(-prop) = prop - 1
+                    let prop_id = !node.property;
+                    
+                    // Evaluate property (j40 uses 0-based: 0=cidx, 1=sidx, 2=y, etc.)
+                    let prop_val = match prop_id {
+                        0 => channel_idx as i32,         // c (channel index)
+                        1 => 0,                          // stream index (always 0 for now)
+                        2 => y as i32,                   // y position
+                        3 => x as i32,                   // x position
+                        4 => n.abs(),                    // |N|
+                        5 => w.abs(),                    // |W|
+                        6 => n,                          // N
+                        7 => w,                          // W
+                        8 => if x > 0 { w - (ww + nw - nww) } else { w }, // W - (WW + NW - NWW)
+                        9 => w + n - nw,                 // W + N - NW
+                        10 => w - nw,                    // W - NW
+                        11 => nw - n,                    // NW - N
+                        12 => n - ne,                    // N - NE
+                        13 => n - nn,                    // N - NN
+                        14 => w - ww,                    // W - WW
+                        15 => 0,                         // max_error (requires WP, not implemented)
+                        _ => 0,                          // Previous channel properties (16+)
                     };
                     
-                    residuals.push(residual);
-                    decoded_count += 1;
+                    // left_child and right_child are relative offsets from current node
+                    // j40: n += val > n->branch.value ? n->branch.leftoff : n->branch.rightoff
+                    let offset = if prop_val > node.value {
+                        node.left_child
+                    } else {
+                        node.right_child
+                    };
+                    
+                    if offset > 0 {
+                        node_idx += offset as usize;
+                    } else {
+                        break;
+                    }
                 }
-                Err(_) => {
-                    break; // Stop when we can't decode more symbols
+                
+                // Get leaf node info
+                let leaf = &self.ma_tree[node_idx];
+                let ctx = leaf.value as usize;  // Context for entropy decoding
+                
+                // Decode residual using entropy code
+                let token = code_state.decode(reader, ctx)?;
+                let residual = unpack_signed(token);
+                
+                // Apply multiplier and offset
+                let adjusted = residual * (leaf.multiplier as i32) + leaf.offset;
+                
+                // Apply predictor
+                let predictor_id = leaf.predictor;
+                let prediction = match predictor_id {
+                    0 => 0,                              // Zero
+                    1 => w,                              // W
+                    2 => n,                              // N
+                    3 => (w + n) / 2,                    // (W + N) / 2
+                    4 => (w.abs() < n.abs()) as i32 * w + (w.abs() >= n.abs()) as i32 * n, // Select
+                    5 => Self::gradient(w, n, nw),       // Gradient
+                    6 => Self::weighted_predictor(w, n, nw, ne, nn), // Weighted
+                    _ => 0,
+                };
+                
+                let pixel_val = adjusted + prediction;
+                pixels[y * width + x] = pixel_val;
+                
+                // Debug: show first few pixels
+                if y == 0 && x < 5 && channel_idx == 0 {
+                    println!("  pixel[{},{}]: token={}, residual={}, pred={}, val={}", 
+                        x, y, token, residual, prediction, pixel_val);
                 }
             }
         }
         
-        println!("Decoded {} residuals from ANS", decoded_count);
-        
-        // If we don't have enough residuals, pad with zeros
-        while residuals.len() < pixel_count {
-            residuals.push(0);
+        // Verify ANS final state
+        if !coeff_code_spec.use_prefix_code {
+            let final_state = code_state.ans_state;
+            println!("  ANS final state: 0x{:08x}", final_state);
         }
-        residuals.truncate(pixel_count);
         
-        // Apply inverse prediction if we have predictors
-        if channel_idx < self.predictors.len() {
-            println!("Applying inverse prediction for channel {}", channel_idx);
-            self.predictors[channel_idx].apply_inverse_prediction(
-                &residuals, 
-                self.width as usize, 
-                self.height as usize
-            )
+        Ok(pixels)
+    }
+    
+    /// Decode a single channel using provided shared CodeState
+    fn decode_channel_with_state(&self, reader: &mut BitstreamReader, code_state: &mut CodeState, 
+                                  coeff_code_spec: &CodeSpec, channel_idx: usize) -> JxlResult<Vec<i32>> {
+        // Get channel dimensions from channel_info
+        let (width, height) = if channel_idx < self.channel_info.len() {
+            let ch_info = &self.channel_info[channel_idx];
+            (ch_info.width, ch_info.height)
         } else {
-            Ok(residuals)
+            (self.width as usize, self.height as usize)
+        };
+        let pixel_count = width * height;
+        
+        // Check if we have MA tree
+        if self.ma_tree.is_empty() {
+            println!("WARNING: No MA tree for channel {}, using placeholder data", channel_idx);
+            return self.generate_placeholder_channel(channel_idx, pixel_count);
         }
+        
+        println!("  Decoding channel {} ({}×{} = {} pixels) using shared CodeState ({} clusters)", 
+            channel_idx, width, height, pixel_count, coeff_code_spec.num_clusters);
+        
+        // Initialize Weighted Predictor for property 15 (max_error) calculation
+        let mut wp = WeightedPredictor::new(width, WpParams::default());
+        
+        // Decode pixels using MA tree + prediction
+        let mut pixels = vec![0i32; pixel_count];
+        
+        for y in 0..height {
+            for x in 0..width {
+                // Get neighboring pixels for prediction and property testing
+                // Following j40 init_neighbors logic:
+                // p.w = x > 0 ? pixels[x - 1] : y > 0 ? pixels[x - stride] : 0;
+                // p.n = y > 0 ? pixels[x - stride] : p.w;
+                // p.nw = x > 0 && y > 0 ? pixels[(x - 1) - stride] : p.w;
+                // etc.
+                let w = if x > 0 { 
+                    pixels[y * width + x - 1] 
+                } else if y > 0 { 
+                    pixels[(y - 1) * width + x]  // N position when x==0
+                } else { 
+                    0 
+                };
+                let n = if y > 0 { pixels[(y - 1) * width + x] } else { w };
+                let nw = if x > 0 && y > 0 { pixels[(y - 1) * width + x - 1] } else { w };
+                let ne = if x < width - 1 && y > 0 { pixels[(y - 1) * width + x + 1] } else { n };
+                let nn = if y > 1 { pixels[(y - 2) * width + x] } else { n };
+                let ww = if x > 1 { pixels[y * width + x - 2] } else { w };
+                let nww = if x > 1 && y > 0 { pixels[(y - 1) * width + x - 2] } else { ww };
+                
+                // Calculate WP state BEFORE tree traversal (needed for property 15)
+                wp.before_predict(x, y, w, n, nw, ne, nn);
+                
+                // Traverse MA tree to find leaf node
+                let mut node_idx = 0;
+                while node_idx < self.ma_tree.len() {
+                    let node = &self.ma_tree[node_idx];
+                    
+                    // j40: while (n->branch.prop < 0) - branch nodes have negative prop
+                    // Our storage: branch nodes have property < 0 (we stored -prop)
+                    if node.property >= 0 {
+                        // This is a leaf node (property = 0 or positive means leaf)
+                        break;
+                    }
+                    
+                    // Get the actual property id
+                    // j40 stores: n->branch.prop = -prop
+                    // j40 retrieves: ~n->branch.prop = ~(-prop) = prop - 1 (for positive prop)
+                    // We stored: property = -prop
+                    // So we need: prop_id = ~(-property) = ~node.property = property - 1
+                    // Actually for two's complement: ~(-x) = x - 1
+                    // So if we stored -prop, ~(-prop) = prop - 1
+                    let prop_id = !node.property;  // This gives prop - 1 for stored -prop
+                    
+                    // Evaluate property (j40 uses 0-based: 0=cidx, 1=sidx, 2=y, etc.)
+                    let prop_val = match prop_id {
+                        0 => channel_idx as i32,     // c (channel index)
+                        1 => 0,                      // stream index (sidx, always 0 for now)
+                        2 => y as i32,               // y position
+                        3 => x as i32,               // x position
+                        4 => n.abs(),                // |N|
+                        5 => w.abs(),                // |W|
+                        6 => n,                      // N
+                        7 => w,                      // W
+                        8 => if x > 0 { w - (ww + nw - nww) } else { w }, // W - (WW + NW - NWW)
+                        9 => w + n - nw,             // W + N - NW
+                        10 => w - nw,                // W - NW
+                        11 => nw - n,                // NW - N
+                        12 => n - ne,                // N - NE
+                        13 => n - nn,                // N - NN
+                        14 => w - ww,                // W - WW
+                        15 => wp.max_error(),        // max_error from WP state
+                        _ => 0,                      // Previous channel properties (16+)
+                    };
+                    
+                    // Debug: show tree traversal for first few pixels
+                    if y == 0 && x < 5 && channel_idx == 0 {
+                        println!("      [traverse ({},{})] node_idx={}, prop_id={}, prop_val={}, value={}", 
+                            x, y, node_idx, prop_id, prop_val, node.value);
+                    }
+                    
+                    // left_child and right_child are relative offsets from current node
+                    // j40: n += val > n->branch.value ? n->branch.leftoff : n->branch.rightoff
+                    let offset = if prop_val > node.value {
+                        node.left_child
+                    } else {
+                        node.right_child
+                    };
+                    
+                    if offset > 0 {
+                        node_idx += offset as usize;
+                    } else {
+                        break;
+                    }
+                }
+                
+                let leaf = &self.ma_tree[node_idx];
+                let ctx = leaf.value as usize;
+                
+                // Decode residual
+                let token = code_state.decode(reader, ctx)?;
+                let residual = unpack_signed(token);
+                let adjusted = residual * (leaf.multiplier as i32) + leaf.offset;
+                
+                // Apply predictor
+                let prediction = match leaf.predictor {
+                    0 => 0,
+                    1 => w,
+                    2 => n,
+                    3 => (w + n) / 2,
+                    4 => if w.abs() < n.abs() { w } else { n },
+                    5 => Self::gradient(w, n, nw),
+                    6 => Self::weighted_predictor(w, n, nw, ne, nn),
+                    _ => 0,
+                };
+                
+                let pixel_val = adjusted + prediction;
+                pixels[y * width + x] = pixel_val;
+                
+                // Update WP state after decoding
+                wp.after_predict(x, y, pixel_val);
+                
+                // Debug first few pixels of first channel
+                if y == 0 && x < 3 && channel_idx == 0 {
+                    println!("    [ch{} ({},{})] ctx={}, token={}, res={}, pred={}, val={}", 
+                        channel_idx, x, y, ctx, token, residual, prediction, pixel_val);
+                }
+            }
+        }
+        
+        Ok(pixels)
+    }
+    
+    /// Generate placeholder channel data (for debugging)
+    fn generate_placeholder_channel(&self, channel_idx: usize, pixel_count: usize) -> JxlResult<Vec<i32>> {
+        let mut data = Vec::with_capacity(pixel_count);
+        for i in 0..pixel_count {
+            let x = i % self.width as usize;
+            let y = i / self.width as usize;
+            let val = match channel_idx {
+                0 => (x * 255 / (self.width as usize).max(1)) as i32,
+                1 => (y * 255 / (self.height as usize).max(1)) as i32,
+                _ => 128,
+            };
+            data.push(val);
+        }
+        Ok(data)
+    }
+    
+    /// Gradient predictor: clamp(N + W - NW, min(N, W), max(N, W))
+    fn gradient(w: i32, n: i32, nw: i32) -> i32 {
+        let sum = w.wrapping_add(n).wrapping_sub(nw);
+        sum.max(w.min(n)).min(w.max(n))
+    }
+    
+    /// Weighted predictor (simplified)
+    fn weighted_predictor(w: i32, n: i32, nw: i32, ne: i32, nn: i32) -> i32 {
+        // Simplified weighted predictor - actual JXL uses more complex weighted sum
+        let sum = w + n + ne + nn - nw;
+        sum / 4
     }
     
     /// Apply transform tree inverse operations in correct order
@@ -1084,6 +1760,163 @@ impl ModularDecoder {
         
         Ok(())
     }
+    
+    //---------- NEW Simple inverse transform functions ----------
+    
+    /// Apply inverse RCT (Reversible Color Transform) - simplified version
+    fn apply_inverse_rct(&self, channels: &mut Vec<ModularChannel>, begin_c: usize, rct_type: u8) -> JxlResult<()> {
+        println!("Applying inverse RCT: begin_c={}, type={}", begin_c, rct_type);
+        
+        if channels.len() < begin_c + 3 {
+            return Err(JxlError::ParseError(format!(
+                "Not enough channels for RCT: need {}, have {}", begin_c + 3, channels.len())));
+        }
+        
+        // Decode rct_type:
+        // type = permutation * 7 + transformation
+        // transformation: 0=none, 1-6 = different YCbCr/YCgCo variants
+        // permutation: 0-5 = different orderings of RGB
+        let permutation = rct_type / 7;
+        let transformation = rct_type % 7;
+        
+        println!("  permutation={}, transformation={}", permutation, transformation);
+        
+        let c0 = begin_c;
+        let c1 = begin_c + 1;
+        let c2 = begin_c + 2;
+        
+        let len = channels[c0].data.len()
+            .min(channels[c1].data.len())
+            .min(channels[c2].data.len());
+        
+        // Apply inverse transformation
+        for i in 0..len {
+            let a = channels[c0].data[i];
+            let b = channels[c1].data[i];
+            let c = channels[c2].data[i];
+            
+            // Apply inverse transformation
+            let (x, y, z) = match transformation {
+                0 => (a, b, c),  // No transformation
+                1 => {
+                    // YCgCo-R: Y=a, Cg=b, Co=c
+                    // Inverse: Y, Co, Cg -> R, G, B
+                    let tmp = a - (b >> 1);
+                    let g = b + tmp;
+                    let r = tmp - (c >> 1);
+                    let b_out = r + c;
+                    (r, g, b_out)
+                }
+                2 => {
+                    // Type 2: different variant
+                    let tmp = a - (c >> 1);
+                    let r = tmp + c;
+                    let g = a;
+                    let b_out = tmp - (b >> 1);
+                    (r, g, b + b_out)
+                }
+                3 => {
+                    // Type 3
+                    let tmp = a - (c >> 1);
+                    let g = tmp + c;
+                    let b_out = tmp - (b >> 1);
+                    let r = b_out + b;
+                    (r, g, b_out)
+                }
+                4 => {
+                    // Type 4
+                    let b_out = a - (c >> 1);
+                    let g = b_out + c;
+                    let r = b_out - (b >> 1);
+                    (r + b, g, b_out)
+                }
+                5 => {
+                    // Type 5
+                    let r = a - (c >> 1);
+                    let g = r + c;
+                    let b_out = r - (b >> 1) + b;
+                    (r, g, b_out)
+                }
+                6 => {
+                    // Type 6: SubtractGreen (most common for lossless)
+                    let g = a;
+                    let r = b + a;
+                    let b_out = c + a;
+                    (r, g, b_out)
+                }
+                _ => (a, b, c),
+            };
+            
+            // Apply permutation
+            let (r, g, b_final) = match permutation {
+                0 => (x, y, z),  // RGB
+                1 => (x, z, y),  // RBG
+                2 => (y, x, z),  // GRB
+                3 => (y, z, x),  // GBR
+                4 => (z, x, y),  // BRG
+                5 => (z, y, x),  // BGR
+                _ => (x, y, z),
+            };
+            
+            channels[c0].data[i] = r;
+            channels[c1].data[i] = g;
+            channels[c2].data[i] = b_final;
+        }
+        
+        println!("Applied inverse RCT transform");
+        Ok(())
+    }
+    
+    /// Apply inverse Palette transform - simplified version
+    fn apply_inverse_palette(&self, channels: &mut Vec<ModularChannel>, begin_c: usize, num_c: usize, 
+                            nb_colours: usize, nb_deltas: usize, d_pred: u8) -> JxlResult<()> {
+        println!("Applying inverse Palette: begin_c={}, num_c={}, nb_colours={}", begin_c, num_c, nb_colours);
+        // TODO: Implement full palette inverse
+        Ok(())
+    }
+    
+    /// Apply inverse Squeeze transform (explicit) - simplified version
+    fn apply_inverse_squeeze_explicit(&self, channels: &mut Vec<ModularChannel>, horizontal: bool, 
+                                      in_place: bool, begin_c: usize, num_c: usize) -> JxlResult<()> {
+        println!("Applying inverse Squeeze: horizontal={}, in_place={}, begin_c={}, num_c={}", 
+            horizontal, in_place, begin_c, num_c);
+        
+        for c in 0..num_c {
+            let channel_idx = begin_c + c;
+            if channel_idx >= channels.len() {
+                continue;
+            }
+            
+            let channel = &mut channels[channel_idx];
+            println!("  Unsqueezing channel {} from {}×{}", channel_idx, channel.width, channel.height);
+            
+            if horizontal {
+                self.unsqueeze_horizontal(channel)?;
+            } else {
+                self.unsqueeze_vertical(channel)?;
+            }
+            
+            println!("  Channel {} after unsqueeze: {}×{}", channel_idx, channel.width, channel.height);
+        }
+        
+        Ok(())
+    }
+    
+    /// Apply inverse Squeeze transform (implicit) - simplified version
+    fn apply_inverse_squeeze_implicit(&self, channels: &mut Vec<ModularChannel>) -> JxlResult<()> {
+        println!("Applying inverse implicit Squeeze");
+        // Implicit squeeze typically applies to all channels
+        for (i, channel) in channels.iter_mut().enumerate() {
+            println!("  Unsqueezing channel {} from {}×{}", i, channel.width, channel.height);
+            // Apply both horizontal and vertical unsqueeze
+            self.unsqueeze_horizontal(channel)?;
+            self.unsqueeze_vertical(channel)?;
+            println!("  Channel {} after unsqueeze: {}×{}", i, channel.width, channel.height);
+        }
+        Ok(())
+    }
+    
+    //---------- OLD transform functions for TransformNode ----------
     
     /// Apply inverse Palette transform
     fn apply_inverse_palette_transform(&self, node: &TransformNode, channels: &mut Vec<ModularChannel>) -> JxlResult<()> {
