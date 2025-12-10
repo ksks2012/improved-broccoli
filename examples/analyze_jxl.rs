@@ -135,13 +135,114 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("all_default: {}", all_default_meta);
     
     if all_default_meta == 0 {
-        // Has custom metadata - need to parse it
-        // Based on your diagnostic output, this takes about 8 bytes total
-        println!("  (Has custom ImageMetadata, skipping detailed parse)");
-        println!("  Based on diagnostic output, jumping to approximate position...");
-        // Your diagnostic showed: consumed 8 bytes, position now: 10
-        // That means metadata ended at byte 10
-        bit_pos = 10 * 8; // byte 10
+        // Has custom metadata
+        let extra_fields = get_bit_msb(&data, bit_pos);
+        bit_pos += 1;
+        println!("  extra_fields: {}", extra_fields);
+        
+        if extra_fields == 0 {
+            // bit_depth: float_sample (1 bit), then U32
+            let float_sample = get_bit_msb(&data, bit_pos);
+            bit_pos += 1;
+            let (bpp, new_pos) = read_u32(&data, bit_pos, 8, 0, 10, 0, 12, 0, 1, 6);
+            bit_pos = new_pos;
+            println!("  bit_depth: float_sample={}, bpp={}", float_sample, bpp);
+            
+            // modular_16bit_buffers (1 bit)
+            let mod_16 = get_bit_msb(&data, bit_pos);
+            bit_pos += 1;
+            println!("  modular_16bit_buffers: {}", mod_16);
+            
+            // num_extra_channels (U32: 0,0,1,0,2,4,1,12)
+            let (nc, new_pos) = read_u32(&data, bit_pos, 0, 0, 1, 0, 2, 4, 1, 12);
+            bit_pos = new_pos;
+            println!("  num_extra_channels: {}", nc);
+            
+            // xyb_encoded (1 bit)
+            let xyb = get_bit_msb(&data, bit_pos);
+            bit_pos += 1;
+            println!("  xyb_encoded: {}", xyb);
+            
+            // ColourEncoding
+            let ce_all_default = get_bit_msb(&data, bit_pos);
+            bit_pos += 1;
+            println!("  ColourEncoding.all_default: {}", ce_all_default);
+            
+            if ce_all_default == 0 {
+                let want_icc = get_bit_msb(&data, bit_pos);
+                bit_pos += 1;
+                println!("  want_icc: {}", want_icc);
+                
+                if want_icc == 0 {
+                    // colour_space enum: U32(0,0,1,0,2,4,18,6)
+                    let (cs, new_pos) = read_enum(&data, bit_pos);
+                    bit_pos = new_pos;
+                    println!("  colour_space: {} (0=RGB, 1=Grey, 2=XYB)", cs);
+                    
+                    // Only read white_point if not XYB
+                    if cs != 2 {
+                        // white_point enum
+                        let (wp, new_pos) = read_enum(&data, bit_pos);
+                        bit_pos = new_pos;
+                        println!("  white_point: {} (1=D65)", wp);
+                        
+                        // Only read primaries if not Grey (cs != 1)
+                        if cs != 1 {
+                            let (prim, new_pos) = read_enum(&data, bit_pos);
+                            bit_pos = new_pos;
+                            println!("  primaries: {} (1=sRGB)", prim);
+                        }
+                    }
+                    
+                    // have_gamma (1 bit)
+                    let have_gamma = get_bit_msb(&data, bit_pos);
+                    bit_pos += 1;
+                    println!("  have_gamma: {}", have_gamma);
+                    
+                    if have_gamma == 0 {
+                        // transfer_function enum
+                        let (tf, new_pos) = read_enum(&data, bit_pos);
+                        bit_pos = new_pos;
+                        println!("  transfer_function: {} (13=sRGB)", tf);
+                    } else {
+                        // gamma value (24 bits)
+                        let _gamma = read_bits_msb(&data, bit_pos, 24);
+                        bit_pos += 24;
+                    }
+                    
+                    // rendering_intent enum
+                    let (ri, new_pos) = read_enum(&data, bit_pos);
+                    bit_pos = new_pos;
+                    println!("  rendering_intent: {} (0=perceptual)", ri);
+                }
+            }
+            
+            println!("  Before extensions: bit_pos={}", bit_pos);
+            
+            // extensions (U64)
+            let ext_sel = read_bits_msb(&data, bit_pos, 2);
+            bit_pos += 2;
+            if ext_sel == 1 {
+                bit_pos += 4;
+            } else if ext_sel == 2 {
+                bit_pos += 8;
+            }
+            println!("  extensions selector: {} (after: bit_pos={})", ext_sel, bit_pos);
+            
+            // default_m (1 bit)
+            let default_m = get_bit_msb(&data, bit_pos);
+            bit_pos += 1;
+            println!("  default_m: {}", default_m);
+        }
+        
+        // zero_pad to byte boundary
+        if bit_pos % 8 != 0 {
+            let pad_bits = 8 - (bit_pos % 8);
+            bit_pos += pad_bits;
+            println!("  Zero padded {} bits to byte boundary", pad_bits);
+        }
+        
+        println!("  After ImageMetadata: bit_pos={} (byte {})", bit_pos, bit_pos / 8);
     }
     
     // Frame Header should be byte-aligned
@@ -212,10 +313,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Read single bit using MSB-first order (standard for JXL)
+// Read single bit using LSB-first order (standard for JXL)
 fn get_bit_msb(data: &[u8], bit_pos: usize) -> u8 {
     let byte_pos = bit_pos / 8;
-    let bit_in_byte = 7 - (bit_pos % 8); // MSB first: bit 0 is MSB (bit 7 of byte)
+    let bit_in_byte = bit_pos % 8; // LSB first: bit 0 is LSB (bit 0 of byte)
     
     if byte_pos < data.len() {
         ((data[byte_pos] >> bit_in_byte) & 1) as u8
@@ -224,11 +325,27 @@ fn get_bit_msb(data: &[u8], bit_pos: usize) -> u8 {
     }
 }
 
-// Read multiple bits using MSB-first order
+// Read multiple bits using LSB-first order
 fn read_bits_msb(data: &[u8], bit_pos: usize, num_bits: usize) -> u32 {
     let mut result = 0u32;
     for i in 0..num_bits {
-        result = (result << 1) | (get_bit_msb(data, bit_pos + i) as u32);
+        result |= (get_bit_msb(data, bit_pos + i) as u32) << i;
     }
     result
+}
+
+// Read U32 with configurable encoding
+fn read_u32(data: &[u8], bit_pos: usize, o0: u32, n0: usize, o1: u32, n1: usize, o2: u32, n2: usize, o3: u32, n3: usize) -> (u32, usize) {
+    let sel = read_bits_msb(data, bit_pos, 2) as usize;
+    let mut pos = bit_pos + 2;
+    let offsets = [o0, o1, o2, o3];
+    let nbits = [n0, n1, n2, n3];
+    let value = read_bits_msb(data, pos, nbits[sel]) + offsets[sel];
+    pos += nbits[sel];
+    (value, pos)
+}
+
+// Read enum using U32(0,0,1,0,2,4,18,6)
+fn read_enum(data: &[u8], bit_pos: usize) -> (u32, usize) {
+    read_u32(data, bit_pos, 0, 0, 1, 0, 2, 4, 18, 6)
 }
