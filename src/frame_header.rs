@@ -82,6 +82,27 @@ pub struct FrameHeader {
 }
 
 impl FrameHeader {
+    /// Read U64 value (variable length encoding per JXL spec)
+    fn read_u64(reader: &mut BitstreamReader) -> JxlResult<u64> {
+        let sel = reader.read_bits(2)?;
+        let mut ret = reader.read_bits((sel * 4) as usize)? as u64;
+        
+        if sel < 3 {
+            // Add offset: 17 >> (8 - sel*4) gives 0, 1, 17 for sel=0,1,2
+            ret += (17u64 >> (8 - sel * 4)) as u64;
+        } else {
+            // sel == 3: variable continuation
+            let mut shift = 12;
+            while shift < 64 && reader.read_bool()? {
+                let nbits = if shift < 56 { 8 } else { 64 - shift };
+                ret |= (reader.read_bits(nbits as usize)? as u64) << shift;
+                shift += 8;
+            }
+        }
+        
+        Ok(ret)
+    }
+    
     /// Parse frame header from bitstream
     /// Note: This function reads all_default from the bitstream, ignoring the parameter
     pub fn parse(reader: &mut BitstreamReader, _all_default_ignored: bool) -> JxlResult<Self> {
@@ -117,8 +138,9 @@ impl FrameHeader {
         };
 
         // ALWAYS read all_default from bitstream first
+        let all_default_pos = reader.get_bit_position();
         let all_default = reader.read_bool()?;
-        println!("DEBUG FrameHeader: all_default={}", all_default);
+        println!("DEBUG FrameHeader: all_default={} (read at bit_pos={})", all_default, all_default_pos);
         
         if all_default {
             println!("DEBUG FrameHeader: Using defaults (VarDct, RegularFrame)");
@@ -126,19 +148,21 @@ impl FrameHeader {
         }
 
         // Parse frame type
+        let frame_type_pos = reader.get_bit_position();
         let frame_type_bits = reader.read_bits(2)?;
         frame_header.frame_type = FrameType::from_u32(frame_type_bits)?;
 
         // Parse encoding type
+        let is_modular_pos = reader.get_bit_position();
         let is_modular = reader.read_bool()?;
         frame_header.encoding = FrameEncoding::from_bool(is_modular);
         
         // Debug output
-        println!("DEBUG FrameHeader: frame_type_bits={}, is_modular={}, encoding={:?}", 
-                 frame_type_bits, is_modular, frame_header.encoding);
+        println!("DEBUG FrameHeader: frame_type_bits={} (at bit {}), is_modular={} (at bit {}), encoding={:?}", 
+                 frame_type_bits, frame_type_pos, is_modular, is_modular_pos, frame_header.encoding);
 
-        // Parse flags
-        frame_header.flags = reader.read_bits(24)? as u64;
+        // Parse flags using U64 encoding (j40__u64)
+        frame_header.flags = Self::read_u64(reader)?;
 
         // Parse duration for non-regular frames
         if frame_header.frame_type != FrameType::RegularFrame {

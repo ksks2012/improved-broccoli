@@ -436,17 +436,18 @@ impl JxlDecoder {
                 }
             }
             
-            // Extensions
-            let extensions = reader.read_bits(64)?;
-            println!("[ImageMetadata] extensions=0x{:016X} at bit {}", extensions, reader.get_bit_position());
+            // Extensions - use U64 variable-length encoding
+            println!("[ImageMetadata] before extensions at bit {}", reader.get_bit_position());
+            let extensions = Self::read_u64(&mut reader)?;
+            println!("[ImageMetadata] extensions=0x{:016X} at bit {} (after reading)", extensions, reader.get_bit_position());
             if extensions != 0 {
                 println!("WARNING: Extensions not fully implemented, skipping...");
                 // For each bit set, read size and skip
                 for i in 0..64 {
                     if (extensions >> i) & 1 != 0 {
-                        let ext_size = reader.read_bits(64)?;
+                        let ext_size = Self::read_u64(&mut reader)?;
                         println!("  Extension {} size={}", i, ext_size);
-                        // Skip ext_size bits
+                        // Skip ext_size bits - inefficient but works
                         for _ in 0..ext_size {
                             reader.read_bits(1)?;
                         }
@@ -459,8 +460,9 @@ impl JxlDecoder {
         
         // default_m - ALWAYS read, even for all_default case!
         // This is OUTSIDE the if block in j40
+        println!("[ImageMetadata] before default_m at bit {}", reader.get_bit_position());
         let default_m = reader.read_bool()?;
-        println!("[ImageMetadata] default_m={} at bit {}", default_m, reader.get_bit_position());
+        println!("[ImageMetadata] default_m={} at bit {} (after reading)", default_m, reader.get_bit_position());
         
         if !default_m {
             // Parse OpsinInverseMatrix and other fields
@@ -515,15 +517,33 @@ impl JxlDecoder {
         Ok(())
     }
     
-    /// Read enum value (variable length encoding)
+    /// Read enum value (j40__enum uses U32 encoding)
     fn read_enum(reader: &mut BitstreamReader) -> JxlResult<u32> {
-        // j40__enum: while (j40__u(st, 1)) ++val
-        // Reads 1 bit at a time, incrementing until we get a 0
-        let mut val = 0u32;
-        while reader.read_bool()? {
-            val += 1;
+        // j40__enum: j40__u32(st, 0, 0, 1, 0, 2, 4, 18, 6)
+        // Config: (0, 0, 1, 0, 2, 4, 18, 6)
+        reader.read_u32_with_config(0, 0, 1, 0, 2, 4, 18, 6)
+    }
+    
+    /// Read U64 value (variable length encoding per JXL spec)
+    /// j40__u64: special variable-length encoding
+    fn read_u64(reader: &mut BitstreamReader) -> JxlResult<u64> {
+        let sel = reader.read_bits(2)?;
+        let mut ret = reader.read_bits((sel * 4) as usize)? as u64;
+        
+        if sel < 3 {
+            // Add offset: 17 >> (8 - sel*4) gives 0, 1, 17 for sel=0,1,2
+            ret += (17u64 >> (8 - sel * 4)) as u64;
+        } else {
+            // sel == 3: variable continuation
+            let mut shift = 12;
+            while shift < 64 && reader.read_bool()? {
+                let nbits = if shift < 56 { 8 } else { 64 - shift };
+                ret |= (reader.read_bits(nbits as usize)? as u64) << shift;
+                shift += 8;
+            }
         }
-        Ok(val)
+        
+        Ok(ret)
     }
     
     /// Read float16 value
