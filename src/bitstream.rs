@@ -213,41 +213,56 @@ impl JxlImageHeader {
     /// Parse the image header from bitstream
     pub fn parse(reader: &mut BitstreamReader) -> JxlResult<Self> {
         // Parse Size Header according to j40__size_header
-        let small = reader.read_bits(1)?;  // Note: This is "small", not "div8"
+        let small_pos = reader.get_bit_position();
+        let div8 = reader.read_bits(1)?;  // j40 calls this "div8"
+        println!("[SizeHeader] div8={} at bit {}", div8, small_pos);
         
-        let height = if small != 0 {
-            // small=1: Use ysize_div8 encoding with U32 config
-            let height_div8 = reader.read_u32_with_config(0, 0, 1, 0, 5, 0, 9, 0)?;
-            (height_div8 + 1) * 8
+        let height = if div8 != 0 {
+            // div8=1: Read 5 bits directly, then multiply by 8
+            let height_div8 = reader.read_bits(5)?;  // j40__u(st, 5)
+            let h = (height_div8 + 1) * 8;
+            println!("[SizeHeader] height_div8={}, height={} at bit {}", height_div8, h, reader.get_bit_position());
+            h
         } else {
-            // small=0: Use full size encoding
-            reader.read_u32_with_config(1, 9, 1, 13, 1, 18, 1, 30)?
+            // div8=0: Use U32 encoding
+            let h = reader.read_u32_with_config(1, 9, 1, 13, 1, 18, 1, 30)?;
+            println!("[SizeHeader] height={} at bit {}", h, reader.get_bit_position());
+            h
         };
         
+        let ratio_pos = reader.get_bit_position();
         let ratio = reader.read_bits(3)?;
+        println!("[SizeHeader] ratio={} at bit {} (now at {})", ratio, ratio_pos, reader.get_bit_position());
+        
         let width = match ratio {
             0 => {
-                if small != 0 {
-                    // small=1: Use xsize_div8 encoding with U32 config
-                    let width_div8 = reader.read_u32_with_config(0, 0, 1, 0, 5, 0, 9, 0)?;
-                    (width_div8 + 1) * 8
+                if div8 != 0 {
+                    // div8=1: Read 5 bits directly, then multiply by 8
+                    let width_div8 = reader.read_bits(5)?;  // j40__u(st, 5)
+                    let w = (width_div8 + 1) * 8;
+                    println!("[SizeHeader] width_div8={}, width={} at bit {}", width_div8, w, reader.get_bit_position());
+                    w
                 } else {
-                    // small=0: Use full size encoding
-                    reader.read_u32_with_config(1, 9, 1, 13, 1, 18, 1, 30)?
+                    // div8=0: Use U32 encoding
+                    let w = reader.read_u32_with_config(1, 9, 1, 13, 1, 18, 1, 30)?;
+                    println!("[SizeHeader] width={} at bit {}", w, reader.get_bit_position());
+                    w
                 }
             }
-            1 => height,
-            2 => (height * 6) / 5,
-            3 => (height * 4) / 3,
-            4 => (height * 3) / 2,
-            5 => (height * 16) / 9,
-            6 => (height * 5) / 4,
-            7 => height * 2,
+            1 => { println!("[SizeHeader] ratio=1, width=height={}", height); height }
+            2 => { println!("[SizeHeader] ratio=2, width={}*6/5={}", height, (height * 6) / 5); (height * 6) / 5 }
+            3 => { println!("[SizeHeader] ratio=3, width={}*4/3={}", height, (height * 4) / 3); (height * 4) / 3 }
+            4 => { println!("[SizeHeader] ratio=4, width={}*3/2={}", height, (height * 3) / 2); (height * 3) / 2 }
+            5 => { println!("[SizeHeader] ratio=5, width={}*16/9={}", height, (height * 16) / 9); (height * 16) / 9 }
+            6 => { println!("[SizeHeader] ratio=6, width={}*5/4={}", height, (height * 5) / 4); (height * 5) / 4 }
+            7 => { println!("[SizeHeader] ratio=7, width={}*2={}", height, height * 2); height * 2 }
             _ => unreachable!(),
         };
 
         // Parse Image Metadata
+        let all_default_pos = reader.get_bit_position();
         let all_default = reader.read_bool()?;
+        println!("[ImageMetadata] all_default={} at bit {} (now at {})", all_default, all_default_pos, reader.get_bit_position());
         
         let mut orientation = 1u8;
         let mut intrinsic_width = width;
@@ -258,14 +273,13 @@ impl JxlImageHeader {
         let mut animation_tps_denominator = 1;
 
         if !all_default {
-            // Extra fields present
+            // Extra fields flag (1 bit)
             let extra_fields = reader.read_bits(1)?;
+            println!("[ImageMetadata] extra_fields={} at bit {}", extra_fields, reader.get_bit_position());
             if extra_fields != 0 {
-                // Orientation
-                let have_orientation = reader.read_bool()?;
-                if have_orientation {
-                    orientation = reader.read_bits(3)? as u8;
-                }
+                // Orientation: always 3 bits if extra_fields is true (j40 line 3220)
+                orientation = (reader.read_bits(3)? + 1) as u8;
+                println!("[ImageMetadata] orientation={} at bit {}", orientation, reader.get_bit_position());
 
                 // Intrinsic size
                 let have_intrinsic_size = reader.read_bool()?;
@@ -293,8 +307,12 @@ impl JxlImageHeader {
             let (bits_per_sample, exp_bits) = Self::parse_bit_depth(reader)?;
             let modular_16bit_buffers = reader.read_bool()?;
             
-            println!("Parsed bit_depth: {} bits, exp_bits: {}, modular_16bit: {}", 
-                     bits_per_sample, exp_bits, modular_16bit_buffers);
+            println!("[ImageMetadata] bit_depth={} bits, exp_bits={}, modular_16bit={} at bit {}",
+                     bits_per_sample, exp_bits, modular_16bit_buffers, reader.get_bit_position());
+            
+            // NOTE: num_extra_channels, xyb_encoded, ColourEncoding, ToneMapping, extensions
+            // and default_m are parsed in parse_image_header() - NOT here!
+            // We return early to let the caller handle the rest.
             
             Ok(JxlImageHeader {
                 width,
@@ -314,6 +332,37 @@ impl JxlImageHeader {
             })
         } else {
             // all_default case: use default values
+            // Still need to read default_m bit
+            let default_m = reader.read_bool()?;
+            println!("  all_default=true, default_m: {}", default_m);
+            
+            if !default_m {
+                // Parse OpsinInverseMatrix and other fields
+                // xyb_encoded is true by default
+                println!("  Parsing OpsinInverseMatrix (9 f16 values)...");
+                for _ in 0..9 {
+                    reader.read_bits(16)?;  // opsin_inv_mat
+                }
+                println!("  Parsing opsin_bias (3 f16 values)...");
+                for _ in 0..3 {
+                    reader.read_bits(16)?;  // opsin_bias
+                }
+                println!("  Parsing quant_bias (3 f16 values)...");
+                for _ in 0..3 {
+                    reader.read_bits(16)?;  // quant_bias
+                }
+                println!("  Parsing quant_bias_num (1 f16 value)...");
+                reader.read_bits(16)?;  // quant_bias_num
+                
+                // cw_mask (3 bits)
+                let cw_mask = reader.read_bits(3)?;
+                println!("  cw_mask: {}", cw_mask);
+                // TODO: Handle up2_weight, up4_weight, up8_weight if mask bits are set
+                if cw_mask != 0 {
+                    println!("  WARNING: cw_mask has set bits, upsampling weights not implemented");
+                }
+            }
+            
             Ok(JxlImageHeader {
                 width,
                 height,
