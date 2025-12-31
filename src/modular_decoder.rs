@@ -79,6 +79,29 @@ pub struct WpParams {
     pub w: [i32; 4],
 }
 
+/// Lookup table for floor(2^24 / (i+1)) used in weighted predictor division
+/// This is J40__24DIVP1 from j40
+const DIV24_P1: [i32; 64] = [
+    0x1000000, 0x800000, 0x555555, 0x400000, 0x333333, 0x2aaaaa, 0x249249, 0x200000,
+    0x1c71c7, 0x199999, 0x1745d1, 0x155555, 0x13b13b, 0x124924, 0x111111, 0x100000,
+    0xf0f0f, 0xe38e3, 0xd7943, 0xccccc, 0xc30c3, 0xba2e8, 0xb2164, 0xaaaaa,
+    0xa3d70, 0x9d89d, 0x97b42, 0x92492, 0x8d3dc, 0x88888, 0x84210, 0x80000,
+    0x7c1f0, 0x78787, 0x75075, 0x71c71, 0x6eb3e, 0x6bca1, 0x69069, 0x66666,
+    0x63e70, 0x61861, 0x5f417, 0x5d174, 0x5b05b, 0x590b2, 0x57262, 0x55555,
+    0x53978, 0x51eb8, 0x50505, 0x4ec4e, 0x4d487, 0x4bda1, 0x4a790, 0x49249,
+    0x47dc1, 0x469ee, 0x456c7, 0x44444, 0x4325c, 0x42108, 0x41041, 0x40000,
+];
+
+/// Get floor(2^24 / (i+1)) from lookup table
+fn div24_p1(i: usize) -> i32 {
+    if i < 64 {
+        DIV24_P1[i]
+    } else {
+        // For larger values, compute directly
+        (16777216 / (i as i32 + 1)) as i32
+    }
+}
+
 impl Default for WpParams {
     fn default() -> Self {
         // Default WP parameters from JXL spec
@@ -156,21 +179,33 @@ impl WeightedPredictor {
         );
         
         // Calculate weighted sum for pred[4]
-        // Using lookup table approximation for division
+        // Using lookup table approximation for division (matching j40)
         let mut w_weights = [0i32; 4];
         let mut wsum = 0i32;
         let mut sum = 0i64;
         
         for i in 0..4 {
             let errsum = errn[i] + errw[i] + errnw[i] + errww[i] + errne[i] + errw2[i];
-            let shift = ((errsum + 1) as u32).leading_zeros() as i32;
-            let shift = (32 - shift - 5).max(0);
-            // Simplified weight calculation
-            w_weights[i] = 4 + ((self.params.w[i] as i64 * 16777216 / (((errsum >> shift) + 1) as i64)) >> shift) as i32;
+            // j40: shift = max(floor_lg(errsum + 1) - 5, 0)
+            // floor_lg(x) = position of highest bit = 31 - leading_zeros(x) for 32-bit
+            let floor_lg = if errsum + 1 > 0 { 
+                31 - ((errsum + 1) as u32).leading_zeros() as i32 
+            } else { 
+                0 
+            };
+            let shift = (floor_lg - 5).max(0);
+            // j40: w[i] = 4 + (wp->params.w[i] * J40__24DIVP1[errsum >> shift] >> shift)
+            let idx = (errsum >> shift) as usize;
+            w_weights[i] = 4 + ((self.params.w[i] as i64 * div24_p1(idx) as i64) >> shift) as i32;
         }
         
-        let logw = ((w_weights[0] + w_weights[1] + w_weights[2] + w_weights[3]) as u32).leading_zeros() as i32;
-        let logw = 32 - logw - 4;
+        // j40: logw = floor_lg(w[0] + w[1] + w[2] + w[3]) - 4
+        let wsum_pre = w_weights[0] + w_weights[1] + w_weights[2] + w_weights[3];
+        let logw = if wsum_pre > 0 {
+            (31 - (wsum_pre as u32).leading_zeros() as i32) - 4
+        } else {
+            0
+        };
         
         for i in 0..4 {
             w_weights[i] >>= logw.max(0);
@@ -179,7 +214,12 @@ impl WeightedPredictor {
         }
         
         if wsum > 0 {
-            self.pred[4] = ((sum + (wsum as i64 / 2) - 1) * 16777216 / (wsum as i64 - 1) / 16777216) as i32;
+            // j40: wp->pred[4] = (((int64_t) sum + (wsum >> 1) - 1) * J40__24DIVP1[wsum - 1] >> 24);
+            // This is effectively: (sum + wsum/2 - 1) / wsum with proper rounding via lookup table
+            // Use lookup table for division by (wsum)
+            // J40__24DIVP1[i] = floor(2^24 / (i+1)), so J40__24DIVP1[wsum-1] = floor(2^24 / wsum)
+            let div_table = div24_p1((wsum - 1).max(0) as usize);
+            self.pred[4] = (((sum + (wsum as i64 >> 1) - 1) * div_table as i64) >> 24) as i32;
         } else {
             self.pred[4] = 0;
         }
@@ -190,6 +230,12 @@ impl WeightedPredictor {
             let hi = w.max(n.max(ne)) * 8;
             self.pred[4] = self.pred[4].max(lo).min(hi);
         }
+        
+        // Debug: trace pred[4] at (1, 4)
+        if x == 1 && y == 4 {
+            println!("      [before_predict ({},{})]: pred[4]={}, w={}, n={}, ne={}, nn={}, nw={}", 
+                x, y, self.pred[4], w, n, ne, nn, nw);
+        }
     }
     
     /// Update error history after decoding a pixel
@@ -199,6 +245,27 @@ impl WeightedPredictor {
             err[i] = ((self.pred[i] - val * 8).abs() + 3) >> 3;
         }
         err[4] = self.pred[4] - val * 8;  // Signed difference for true error
+        
+        // Debug: trace error at positions on row 1 which will be used for row 2
+        if y == 1 && x < 3 {
+            println!("      [after_predict ({},{})]: pred[0-4]={:?}, val*8={}, err={:?}", 
+                x, y, self.pred, val * 8, err);
+        }
+        // Debug: trace error at position (1, 4) which will be used as trueerrne at (0, 5)
+        if y == 4 && x == 1 {
+            println!("      [after_predict ({},{})]: pred[4]={}, val*8={}, err[4]={}", 
+                x, y, self.pred[4], val * 8, err[4]);
+        }
+        // Debug: trace (198, 58) which provides trueerrne for (197, 59)
+        if y == 58 && x == 198 {
+            println!("      [after_predict ({},{})]: pred[4]={}, val*8={}, err[4]={}", 
+                x, y, self.pred[4], val * 8, err[4]);
+        }
+        // Debug: trace pixel (197,59) and (196,59) in channel 1
+        if y == 59 && (x == 196 || x == 197 || x == 198) {
+            println!("      [after_predict ({},{})]: pred[4]={}, val*8={}, err[4]={}", 
+                x, y, self.pred[4], val * 8, err[4]);
+        }
     }
     
     /// Get max_error (property 15) - the trueerr with largest absolute value
@@ -493,6 +560,9 @@ impl ModularDecoder {
         println!("Parsing second code_spec for {} contexts...", ctx_id);
         let coeff_code_spec = parse_code_spec(reader, ctx_id as usize)?;
         println!("Second code_spec parsed, bit_pos now {}", reader.get_bit_position());
+        println!("  Second code_spec: num_clusters={}, cluster_map={:?}", 
+                 coeff_code_spec.num_clusters, coeff_code_spec.cluster_map);
+        println!("  Second code_spec: use_prefix_code={}", coeff_code_spec.use_prefix_code);
         
         // Store the coefficient code spec for pixel decoding
         self.coeff_code_spec = Some(coeff_code_spec);
@@ -840,35 +910,301 @@ impl ModularDecoder {
         }
     }
     
-    /// Parse cluster_map
-    fn parse_cluster_map(&self, reader: &mut BitstreamReader, num_dist: usize) -> JxlResult<(usize, Vec<u8>)> {
+    /// Parse cluster_map (following j40__cluster_map)
+    fn parse_cluster_map(&mut self, reader: &mut BitstreamReader, num_dist: usize) -> JxlResult<(usize, Vec<u8>)> {
+        let start_pos = reader.get_bit_position();
+        println!("  cluster_map: num_dist={}, start_pos={}", num_dist, start_pos);
+        
         if num_dist == 1 {
+            println!("  cluster_map: num_dist=1, trivial case");
             return Ok((1, vec![0]));
         }
         
-        let use_mtf = reader.read_bool()?;
-        let nbits = reader.read_bits(2)?;
-        let mut cluster_map = Vec::with_capacity(num_dist);
+        let max_allowed = num_dist.min(256);
+        let mut cluster_map = vec![0u8; num_dist];
         
-        if nbits == 0 {
-            // All contexts map to cluster 0
-            cluster_map = vec![0u8; num_dist];
-            return Ok((1, cluster_map));
+        // First bit: is_simple (whether cluster count < 8)
+        let is_simple = reader.read_bool()?;
+        println!("  cluster_map: is_simple={} (bit_pos now {})", is_simple, reader.get_bit_position());
+        
+        if is_simple {
+            // Simple encoding: read nbits, then read each entry with nbits
+            let nbits = reader.read_bits(2)? as usize;
+            println!("  cluster_map: simple mode, nbits={}", nbits);
+            
+            for i in 0..num_dist {
+                let value = reader.read_bits(nbits)? as u8;
+                if (value as usize) >= max_allowed {
+                    return Err(JxlError::ParseError(format!(
+                        "cluster_map[{}]={} exceeds max_allowed {}", i, value, max_allowed)));
+                }
+                cluster_map[i] = value;
+            }
+        } else {
+            // Complex encoding: use recursive ANS decoding
+            let use_mtf = reader.read_bool()?;
+            println!("  cluster_map: complex mode, use_mtf={}", use_mtf);
+            
+            // Need to recursively read code spec for cluster_map
+            // For now, implement a simplified version based on j40
+            // When num_dist <= 2, lz77 is disabled (pass -1), else lz77=1
+            let nested_num_dist = if num_dist <= 2 { -1i32 } else { 1 };
+            println!("  cluster_map: nested code spec with lz77={}", nested_num_dist);
+            
+            // Parse nested code spec (simplified - for cluster_map, usually simple encoding)
+            // Read LZ77 enabled (should be false for cluster_map typically)
+            let nested_lz77_enabled = if nested_num_dist > 0 {
+                reader.read_bool()?
+            } else {
+                false
+            };
+            println!("  cluster_map: nested_lz77_enabled={}", nested_lz77_enabled);
+            
+            if nested_lz77_enabled {
+                return Err(JxlError::ParseError("LZ77 in nested cluster_map not yet supported".into()));
+            }
+            
+            // Nested cluster_map (for 1 distribution - trivial)
+            let nested_num_clusters;
+            let _nested_cluster_map;
+            if nested_num_dist.abs() == 1 || nested_num_dist <= 0 {
+                nested_num_clusters = 1;
+                _nested_cluster_map = vec![0u8; 1];
+            } else {
+                // Recursive call would go here, but for nested cluster maps with 1 dist,
+                // it's always trivial
+                nested_num_clusters = 1;
+                _nested_cluster_map = vec![0u8; nested_num_dist.abs() as usize];
+            }
+            
+            // Read use_prefix_code
+            let nested_use_prefix = reader.read_bool()?;
+            println!("  cluster_map: nested use_prefix_code={}", nested_use_prefix);
+            
+            if nested_use_prefix {
+                // Parse prefix code for the nested spec
+                // For cluster_map with 1 cluster, we need to read hybrid int config
+                self.skip_hybrid_int_config(reader, 15)?;
+                
+                // Read count
+                let has_count = reader.read_bool()?;
+                let count = if has_count {
+                    let n = reader.read_bits(4)? as usize;
+                    1 + (1 << n) + reader.read_bits(n)? as usize
+                } else {
+                    1
+                };
+                println!("  cluster_map: nested prefix count={}", count);
+                
+                // Parse prefix code tree
+                let (fast_len, max_len, table) = self.parse_prefix_code_tree(reader, count)?;
+                println!("  cluster_map: prefix tree fast_len={}, max_len={}", fast_len, max_len);
+                
+                // Decode each cluster_map entry using prefix code
+                for i in 0..num_dist {
+                    let symbol = self.decode_prefix_symbol(reader, &table, fast_len, max_len)?;
+                    if symbol >= max_allowed {
+                        return Err(JxlError::ParseError(format!(
+                            "cluster_map[{}]={} exceeds max_allowed {}", i, symbol, max_allowed)));
+                    }
+                    cluster_map[i] = symbol as u8;
+                }
+            } else {
+                // ANS encoding
+                let nested_log_alpha = 5 + reader.read_bits(2)?;
+                println!("  cluster_map: nested log_alpha_size={}", nested_log_alpha);
+                
+                // Read hybrid int config for the single cluster
+                self.skip_hybrid_int_config(reader, nested_log_alpha as usize)?;
+                
+                // Parse ANS distribution
+                let dist = self.parse_ans_distribution(reader, nested_log_alpha)?;
+                
+                // Build alias table and decode
+                let alias_table = self.build_alias_table(&dist)?;
+                
+                // Initialize ANS state
+                let mut ans_state = reader.read_bits(32)? as u32;
+                
+                // Decode each cluster_map entry
+                for i in 0..num_dist {
+                    let (symbol, new_state) = self.ans_decode(reader, &alias_table, ans_state)?;
+                    ans_state = new_state;
+                    if symbol >= max_allowed {
+                        return Err(JxlError::ParseError(format!(
+                            "cluster_map[{}]={} exceeds max_allowed {}", i, symbol, max_allowed)));
+                    }
+                    cluster_map[i] = symbol as u8;
+                }
+            }
+            
+            // Apply MTF transform if needed
+            if use_mtf {
+                let mut mtf: Vec<u8> = (0..=255).collect();
+                for i in 0..num_dist {
+                    let j = cluster_map[i] as usize;
+                    let moved = mtf[j];
+                    cluster_map[i] = moved;
+                    // Shift elements
+                    for k in (1..=j).rev() {
+                        mtf[k] = mtf[k - 1];
+                    }
+                    mtf[0] = moved;
+                }
+            }
         }
         
-        // Read cluster assignments
-        for _ in 0..num_dist {
-            let cluster = reader.read_bits(nbits as usize)? as u8;
-            cluster_map.push(cluster);
+        // Calculate num_clusters from cluster_map (first unset position in seen bitmap)
+        let mut seen = [0u32; 8];
+        for &c in &cluster_map {
+            seen[(c >> 5) as usize] |= 1u32 << (c & 31);
+        }
+        let mut num_clusters = 0usize;
+        for i in 0..256 {
+            if (seen[i >> 5] >> (i & 31)) & 1 != 0 {
+                num_clusters = i + 1;
+            } else {
+                break;
+            }
+        }
+        // First unset position
+        let mut first_unset = 0usize;
+        for i in 0..256 {
+            if (seen[i >> 5] >> (i & 31)) & 1 == 0 {
+                first_unset = i;
+                break;
+            }
+            first_unset = i + 1;
+        }
+        num_clusters = first_unset;
+        if num_clusters == 0 {
+            num_clusters = 1;
         }
         
-        let num_clusters = *cluster_map.iter().max().unwrap_or(&0) as usize + 1;
-        
-        if use_mtf {
-            // Apply move-to-front transform (simplified - just return as-is for now)
-        }
-        
+        println!("  cluster_map result: num_clusters={}, map={:?}", num_clusters, &cluster_map[..num_dist.min(20)]);
         Ok((num_clusters, cluster_map))
+    }
+    
+    /// Parse prefix code tree (simplified version)
+    fn parse_prefix_code_tree(&self, reader: &mut BitstreamReader, count: usize) -> JxlResult<(usize, usize, Vec<(u16, u8)>)> {
+        // Returns (fast_len, max_len, table) where table is (symbol, length) pairs
+        
+        if count == 1 {
+            // Single symbol - no bits needed
+            return Ok((0, 0, vec![(0, 0)]));
+        }
+        
+        // Read code kind for > 1 symbols
+        let code_kind = reader.read_bits(2)?;
+        println!("    prefix_code: count={}, kind={}", count, code_kind);
+        
+        match code_kind {
+            0 => {
+                // Simple prefix code
+                // Read nsym directly encoded symbols
+                let nsym = reader.read_bits(2)? + 1;
+                let mut symbols = Vec::new();
+                
+                // Read symbols
+                for _i in 0..nsym {
+                    let bits_for_sym = self.ceil_log2(count as u32) as usize;
+                    let sym = reader.read_bits(bits_for_sym)? as u16;
+                    symbols.push(sym);
+                }
+                
+                // Determine code lengths based on nsym
+                let lengths: Vec<u8> = match nsym {
+                    1 => vec![0],
+                    2 => vec![1, 1],
+                    3 => vec![1, 2, 2],
+                    4 => {
+                        let tree_sel = reader.read_bool()?;
+                        if tree_sel {
+                            vec![2, 2, 2, 2]
+                        } else {
+                            vec![1, 2, 3, 3]
+                        }
+                    }
+                    _ => return Err(JxlError::ParseError("Invalid nsym in prefix code".into())),
+                };
+                
+                // Build table
+                let mut table = Vec::new();
+                for (sym, len) in symbols.iter().zip(lengths.iter()) {
+                    table.push((*sym, *len));
+                }
+                
+                let max_len = *lengths.iter().max().unwrap_or(&0) as usize;
+                Ok((max_len.min(8), max_len, table))
+            }
+            1 => {
+                // Complex prefix code with explicit lengths
+                // This is more complex - for now return a simple fallback
+                println!("    prefix_code: complex kind=1, using fallback");
+                // Just create identity mapping with 1-bit lengths
+                let mut table = Vec::new();
+                for i in 0..count.min(256) {
+                    table.push((i as u16, 8));
+                }
+                Ok((8, 8, table))
+            }
+            _ => {
+                // Kind 2 and 3 are special cases
+                Err(JxlError::ParseError(format!("Prefix code kind {} not yet implemented", code_kind)))
+            }
+        }
+    }
+    
+    /// Decode a symbol using prefix code
+    fn decode_prefix_symbol(&self, reader: &mut BitstreamReader, table: &[(u16, u8)], fast_len: usize, max_len: usize) -> JxlResult<usize> {
+        if table.len() == 1 {
+            return Ok(table[0].0 as usize);
+        }
+        
+        // Simple linear search for now (should be optimized with lookup table)
+        let bits = reader.peek_bits(max_len.max(1))?;
+        
+        // Try to match each symbol
+        for (symbol, len) in table {
+            if *len == 0 {
+                return Ok(*symbol as usize);
+            }
+            // This is a simplified decoder - real implementation needs canonical Huffman
+        }
+        
+        // Fallback: read enough bits and return 0
+        if fast_len > 0 {
+            let _bits = reader.read_bits(fast_len)?;
+        }
+        Ok(0)
+    }
+    
+    /// Build alias table for ANS decoding
+    fn build_alias_table(&self, dist: &[i16]) -> JxlResult<Vec<(u16, u16, u16)>> {
+        // Simplified alias table: (symbol, cutoff, offset)
+        // For now, just return a basic table
+        let mut table = Vec::new();
+        for (i, &d) in dist.iter().enumerate() {
+            if d > 0 {
+                table.push((i as u16, d as u16, 0));
+            }
+        }
+        if table.is_empty() {
+            table.push((0, 4096, 0));
+        }
+        Ok(table)
+    }
+    
+    /// Decode one symbol using ANS
+    fn ans_decode(&self, reader: &mut BitstreamReader, _table: &[(u16, u16, u16)], state: u32) -> JxlResult<(usize, u32)> {
+        // Simplified ANS decode - returns (symbol, new_state)
+        // Real implementation needs proper rANS decoding
+        let symbol = (state & 0xFF) as usize;
+        let new_state = state >> 8;
+        // Read more bits to refill state if needed
+        let refill = reader.read_bits(8)? as u32;
+        let new_state = (new_state << 8) | refill;
+        Ok((symbol % 256, new_state))
     }
     
     /// Parse ANS distribution table (following j40__ans_table)
@@ -1250,7 +1586,10 @@ impl ModularDecoder {
         for channel_idx in 0..num_gm_channels {
             let ch_info = &self.channel_info[channel_idx];
             println!("  Decoding channel {} ({}×{}) from LfGlobal...", channel_idx, ch_info.width, ch_info.height);
+            println!("    CodeState before ch{}: num_decoded={}", channel_idx, code_state.num_decoded);
             let channel_data = self.decode_channel_with_state(reader, &mut code_state, &coeff_code_spec, channel_idx)?;
+            println!("    CodeState after ch{}: num_decoded={}", channel_idx, code_state.num_decoded);
+            println!("  Channel {} decoded, bit_pos now {}", channel_idx, reader.get_bit_position());
             
             // Debug: print first few values of meta channels
             if channel_idx < 2 {
@@ -1575,6 +1914,7 @@ impl ModularDecoder {
                 let nn = if y > 1 { pixels[(y - 2) * width + x] } else { n };
                 let ww = if x > 1 { pixels[y * width + x - 2] } else { w };
                 let nww = if x > 1 && y > 0 { pixels[(y - 1) * width + x - 2] } else { ww };
+                let nee = if x + 2 < width && y > 0 { pixels[(y - 1) * width + x + 2] } else { ne };
                 
                 // Calculate WP state BEFORE tree traversal (needed for property 15)
                 wp.before_predict(x, y, w, n, nw, ne, nn);
@@ -1621,10 +1961,29 @@ impl ModularDecoder {
                         _ => 0,                      // Previous channel properties (16+)
                     };
                     
-                    // Debug: show tree traversal for first few pixels
-                    if y == 0 && x < 5 && channel_idx == 0 {
-                        println!("      [traverse ({},{})] node_idx={}, prop_id={}, prop_val={}, value={}", 
+                    // Debug: show tree traversal for specific pixels in channel 1
+                    let ch1_pixel_idx = (y * width + x) as usize;
+                    if channel_idx == 1 && ch1_pixel_idx >= 11996 && ch1_pixel_idx <= 11999 {
+                        let offset = if prop_val > node.value { node.left_child } else { node.right_child };
+                        let next_idx = node_idx as i32 + offset;
+                        println!("      [traverse ch1 ({},{}) px={}] node_idx={}, prop_id={}, prop_val={}, value={}, offset={}, next={}",
+                            x, y, ch1_pixel_idx, node_idx, prop_id, prop_val, node.value, offset, next_idx);
+                        if prop_id == 15 {
+                            println!("        wp: trueerrw={}, trueerrn={}, trueerrnw={}, trueerrne={}, max={}",
+                                wp.trueerrw, wp.trueerrn, wp.trueerrnw, wp.trueerrne, prop_val);
+                        }
+                    } else if channel_idx == 1 && y == 2 && x < 3 {
+                        println!("      [traverse ch1 ({},{}) y=2] node_idx={}, prop_id={}, prop_val={}, value={}", 
                             x, y, node_idx, prop_id, prop_val, node.value);
+                        if prop_id == 15 {
+                            println!("        wp.trueerrw={}, trueerrn={}, trueerrnw={}, trueerrne={}", 
+                                wp.trueerrw, wp.trueerrn, wp.trueerrnw, wp.trueerrne);
+                            println!("        wp.errors[0][x]={:?}, errors[1][x]={:?}", 
+                                wp.errors[0].get(x), wp.errors[1].get(x));
+                        }
+                    } else if y == 0 && x < 5 && channel_idx < 2 {
+                        println!("      [traverse ({},{}) ch{}] node_idx={}, prop_id={}, prop_val={}, value={}", 
+                            x, y, channel_idx, node_idx, prop_id, prop_val, node.value);
                     }
                     
                     // left_child and right_child are relative offsets from current node
@@ -1645,6 +2004,15 @@ impl ModularDecoder {
                 let leaf = &self.ma_tree[node_idx];
                 let ctx = leaf.value as usize;
                 
+                // Debug: show leaf info for (198,58) in ch1
+                let ch1_pixel_idx2 = (y * width + x) as usize;
+                if channel_idx == 1 && ch1_pixel_idx2 == 11798 {
+                    println!("      [leaf ({},{}) px={}] node_idx={}, ctx={}, pred={}, offset={}, mult={}",
+                        x, y, ch1_pixel_idx2, node_idx, ctx, leaf.predictor, leaf.offset, leaf.multiplier);
+                    println!("        w={}, n={}, nw={}, ne={}, nn={}", w, n, nw, ne, nn);
+                    println!("        wp.pred[4]={}", wp.pred[4]);
+                }
+                
                 // Decode residual
                 let token = code_state.decode(reader, ctx)?;
                 let residual = unpack_signed(token);
@@ -1656,11 +2024,23 @@ impl ModularDecoder {
                     1 => w,
                     2 => n,
                     3 => (w + n) / 2,
-                    4 => if w.abs() < n.abs() { w } else { n },
+                    4 => if (n - nw).abs() < (w - nw).abs() { w } else { n },  // Fixed: matching j40 logic
                     5 => Self::gradient(w, n, nw),
-                    6 => Self::weighted_predictor(w, n, nw, ne, nn),
+                    6 => (wp.pred[4] + 3) >> 3,  // Use actual WP pred[4], not simplified version
+                    7 => ne,
+                    8 => nw,
+                    9 => ww,
+                    10 => (w + nw) / 2,
+                    11 => (n + nw) / 2,
+                    12 => (n + ne) / 2,
+                    13 => (6 * n - 2 * nn + 7 * w + ww + nee + 3 * ne + 8) / 16,
                     _ => 0,
                 };
+                
+                // Debug: show prediction for (198,58) in ch1
+                if channel_idx == 1 && ch1_pixel_idx2 == 11798 {
+                    println!("        prediction={}", prediction);
+                }
                 
                 let pixel_val = adjusted + prediction;
                 pixels[y * width + x] = pixel_val;
@@ -1668,8 +2048,18 @@ impl ModularDecoder {
                 // Update WP state after decoding
                 wp.after_predict(x, y, pixel_val);
                 
-                // Debug first few pixels of first channel
-                if y == 0 && x < 3 && channel_idx == 0 {
+                // Debug: show progress every 1000 pixels for channel 2
+                let pixel_idx = y * width + x;
+                // Debug for problematic region (ch2 pixel 590-810)
+                if channel_idx == 2 && pixel_idx >= 590 && pixel_idx <= 810 {
+                    println!("    [ch2 DETAIL ({},{})] px={}, ctx={}, token={}, res={}, pred={}, val={}, bit_pos={}",
+                        x, y, pixel_idx, ctx, token, residual, prediction, pixel_val,
+                        reader.get_bit_position());
+                } else if channel_idx == 2 && pixel_idx % 2000 == 0 {
+                    println!("    [ch{} ({},{})] idx={}, ctx={}, token={}, res={}, pred={}, val={}, bit_pos={}",
+                        channel_idx, x, y, pixel_idx, ctx, token, residual, prediction, pixel_val,
+                        reader.get_bit_position());
+                } else if y == 0 && x < 10 && channel_idx < 3 {
                     println!("    [ch{} ({},{})] ctx={}, token={}, res={}, pred={}, val={}", 
                         channel_idx, x, y, ctx, token, residual, prediction, pixel_val);
                 }
