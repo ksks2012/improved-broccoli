@@ -265,6 +265,8 @@ impl<'a> CodeState<'a> {
     pub fn decode(&mut self, reader: &mut BitstreamReader, ctx: usize) -> JxlResult<i32> {
         // Handle LZ77 copy
         if self.num_to_copy > 0 {
+            println!("    [UNEXPECTED] LZ77 copy path taken! num_to_copy={}, num_decoded={}", 
+                     self.num_to_copy, self.num_decoded);
             self.num_to_copy -= 1;
             if let Some(window) = &self.window {
                 let mask = 0xfffff;
@@ -288,15 +290,16 @@ impl<'a> CodeState<'a> {
         
         let cluster_idx = self.spec.cluster_map[ctx] as usize;
         
-        // Debug: show cluster mapping for specific contexts
-        if ctx == 4 {
-            println!("    [DEBUG ctx=4] cluster_idx={}, clusters.len()={}", cluster_idx, self.spec.clusters.len());
+        // Debug: show cluster mapping at milestones
+        if self.num_decoded % 1000 == 999 && self.num_decoded >= 79999 && self.num_decoded <= 81999 {
+            println!("    [DEBUG cluster] num_decoded={}, ctx={}, cluster_idx={}, ans_state_before=0x{:08x}",
+                     self.num_decoded, ctx, cluster_idx, self.ans_state);
         }
         
         // Decode token using appropriate method
         let token = if self.spec.use_prefix_code {
             if cluster_idx >= self.spec.prefix_clusters.len() {
-                return Err(JxlError::DecodeError(format!("Prefix cluster {} >= num", cluster_idx)));
+                return Err(JxlError::DecodeError(format!("Prefix cluster {} >= num {}", cluster_idx, self.spec.prefix_clusters.len())));
             }
             let cluster = &self.spec.prefix_clusters[cluster_idx];
             self.prefix_code(reader, cluster)?
@@ -367,9 +370,17 @@ impl<'a> CodeState<'a> {
         } else {
             let cluster = &self.spec.clusters[cluster_idx];
             let v = cluster.config.decode(reader, token)?;
-            // Reduced debug output
+        // Debug: show hybrid_int result for ch2 problematic region
+            if self.num_decoded >= 80398 && self.num_decoded <= 80410 {
+                println!("    [hybrid_int ch2] num_decoded={}, token={}, value={}, split_exp={}, msb={}, lsb={}, ctx={}, bit_pos={}",
+                    self.num_decoded, token, v, cluster.config.split_exp, 
+                    cluster.config.msb_in_token, cluster.config.lsb_in_token, ctx, reader.get_bit_position());
+            }
             v
         };
+        
+        // Track decode count (always, for debugging)
+        self.num_decoded += 1;
         
         // Update LZ77 window if enabled
         if self.spec.lz77_enabled {
@@ -378,9 +389,8 @@ impl<'a> CodeState<'a> {
             }
             if let Some(w) = &mut self.window {
                 let mask = 0xfffff;
-                w[self.num_decoded as usize & mask] = value;
+                w[(self.num_decoded - 1) as usize & mask] = value;
             }
-            self.num_decoded += 1;
         }
         
         Ok(value)
@@ -431,19 +441,49 @@ impl<'a> CodeState<'a> {
         
         let bucket = &cluster.aliases[i];
         
-        // Debug for bucket 25
-        if i == 25 {
-            println!("    [ANS DEBUG] i=25, bucket: cutoff={}, symbol={}, offset={}", 
-                     bucket.cutoff, bucket.symbol, bucket.offset_or_next);
-            println!("    [ANS DEBUG] cluster D[25]={}", cluster.d.get(25).unwrap_or(&-999));
-            println!("    [ANS DEBUG] cluster D array (10-30): {:?}", &cluster.d[10..30.min(cluster.d.len())]);
-        }
-        
         let symbol = if (pos as i16) < bucket.cutoff {
             i as i32
         } else {
             bucket.symbol as i32
         };
+        
+        // Debug for bucket 25
+        if i == 25 {
+            println!("    [ANS DEBUG] i=25, bucket: cutoff={}, symbol_in_bucket={}, offset={}", 
+                     bucket.cutoff, bucket.symbol, bucket.offset_or_next);
+            println!("    [ANS DEBUG] cluster D (first 10): {:?}", &cluster.d[..10.min(cluster.d.len())]);
+            println!("    [ANS DEBUG] actual decoded symbol = {}, D[sym]={}", symbol, cluster.d.get(symbol as usize).unwrap_or(&-999));
+        }
+        
+        // Debug around pixel 599 in ch2 (num_decoded ~ 80598-80602)
+        if self.num_decoded >= 80598 && self.num_decoded <= 80605 {
+            println!("    [ANS ch2 px599] num_decoded={}, state=0x{:08x}, index={}, i={}, pos={}",
+                     self.num_decoded, self.ans_state, index, i, pos);
+            println!("    [ANS ch2 px599] bucket[{}]: cutoff={}, symbol={}, offset={}", 
+                     i, bucket.cutoff, bucket.symbol, bucket.offset_or_next);
+            println!("    [ANS ch2 px599] decoded symbol={}", symbol);
+        }
+        // Extended debug for state evolution (idx 80600-80650)
+        if self.num_decoded >= 80600 && self.num_decoded <= 80650 {
+            let d_symbol = cluster.d[symbol as usize];
+            let calc_offset = if (pos as i16) < bucket.cutoff { 0 } else { bucket.offset_or_next as u32 };
+            let new_state_calc = (d_symbol as u32) * (self.ans_state >> 12) + calc_offset + (pos as u32);
+            println!("    [ANS state] idx={}, state=0x{:08x}, D[{}]={}, calc_offset={}, pos={}, new_state=0x{:08x}",
+                     self.num_decoded, self.ans_state, symbol, d_symbol, calc_offset, pos, new_state_calc);
+        }
+        // Additional debug: show ANS state evolution during problematic region
+        if self.num_decoded >= 80598 && self.num_decoded <= 80605 {
+            let d_symbol = cluster.d[symbol as usize];
+            let calc_offset = if (pos as i16) < bucket.cutoff { 0 } else { bucket.offset_or_next as u32 };
+            let new_state_calc = (d_symbol as u32) * (self.ans_state >> 12) + calc_offset + (pos as u32);
+            // Also show cluster's bucket[27] to identify which cluster is being used
+            let b27 = &cluster.aliases[27];
+            println!("    [ANS state] idx={}, state=0x{:08x}, sym={}, D[sym]={}, offset={}, pos={}, new_state=0x{:08x}, bit_pos={}",
+                     self.num_decoded, self.ans_state, symbol, d_symbol, calc_offset, pos, new_state_calc, reader.get_bit_position());
+            println!("    [ANS state] cluster bucket[27]: cutoff={}, symbol={}, offset={}", 
+                     b27.cutoff, b27.symbol, b27.offset_or_next);
+        }
+        
         let offset = if (pos as i16) < bucket.cutoff {
             0
         } else {
@@ -465,12 +505,28 @@ impl<'a> CodeState<'a> {
         }
         
         // Update state
+        let old_state = self.ans_state;
         self.ans_state = (d_symbol as u32) * (self.ans_state >> 12) + offset + (pos as u32);
         
+        // Debug: track renormalization at specific points
+        let need_renorm = self.ans_state < (1 << 16);
+        
         // Renormalize
-        if self.ans_state < (1 << 16) {
+        if need_renorm {
             let low = reader.read_bits(16)?;
             self.ans_state = (self.ans_state << 16) | low;
+            // Debug: log all renormalizations
+            println!("    [ANS renorm] idx={}, old_state=0x{:08x}, new_state=0x{:08x}, bit_pos={}",
+                     self.num_decoded, old_state, self.ans_state, reader.get_bit_position());
+        }
+        
+        // Debug output at regular intervals to track bit position growth
+        let next_idx = self.num_decoded;
+        // Track at milestones
+        let is_milestone = next_idx % 1000 == 999 && next_idx >= 79999 && next_idx <= 81999;
+        if is_milestone {
+            println!("[OURS ANS] count={}, state=0x{:08x}, sym={}, bit_pos={}",
+                     next_idx, self.ans_state, symbol, reader.get_bit_position());
         }
         
         Ok(symbol)
@@ -613,6 +669,8 @@ fn parse_code_spec_recursive(reader: &mut BitstreamReader, num_dist: usize, allo
             });
         }
         
+        println!("  Prefix code_spec parsing complete at bit_pos {}", reader.get_bit_position());
+        
         return Ok(CodeSpec {
             num_dist: effective_num_dist,
             lz77_enabled,
@@ -634,16 +692,25 @@ fn parse_code_spec_recursive(reader: &mut BitstreamReader, num_dist: usize, allo
     
     // Parse HybridIntConfig for each cluster
     let mut configs = Vec::with_capacity(num_clusters);
-    for _ in 0..num_clusters {
+    for i in 0..num_clusters {
         let config = HybridIntConfig::parse(reader, log_alpha_size)?;
+        println!("    [recursive] Cluster {} HybridIntConfig: split_exp={}, msb={}, lsb={}", 
+                 i, config.split_exp, config.msb_in_token, config.lsb_in_token);
         configs.push(config);
     }
     
     // Parse ANS distribution tables
     let mut clusters = Vec::with_capacity(num_clusters);
     for i in 0..num_clusters {
+        println!("    [recursive] Parsing ANS dist for cluster {} at bit_pos {}", i, reader.get_bit_position());
         let d = parse_ans_distribution(reader, log_alpha_size)?;
+        println!("    [recursive] D array first 10: {:?}", &d[..10.min(d.len())]);
         let cluster = AnsCluster::new(configs[i].clone(), d, log_alpha_size)?;
+        println!("    [recursive] Cluster {} aliases first 5:", i);
+        for j in 0..5.min(cluster.aliases.len()) {
+            let a = &cluster.aliases[j];
+            println!("      [{}] cutoff={}, symbol={}, offset={}", j, a.cutoff, a.symbol, a.offset_or_next);
+        }
         clusters.push(cluster);
     }
     
@@ -714,6 +781,13 @@ pub fn parse_code_spec(reader: &mut BitstreamReader, num_dist: usize) -> JxlResu
         println!("  Parsing ANS distribution for cluster {} at bit_pos {}", i, reader.get_bit_position());
         let d = parse_ans_distribution(reader, log_alpha_size)?;
         let cluster = AnsCluster::new(configs[i].clone(), d, log_alpha_size)?;
+        
+        // Debug: print bucket[27] for all clusters (to compare with j40)
+        if cluster.aliases.len() > 27 {
+            let a = &cluster.aliases[27];
+            println!("  [DEBUG bucket] cluster {} bucket[27]: cutoff={}, symbol={}, offset={}", 
+                     i, a.cutoff, a.symbol, a.offset_or_next);
+        }
         
         // Debug: print alias table for cluster 0 (used by ctx=4 for shift)
         if i == 0 {
@@ -795,6 +869,8 @@ fn parse_prefix_code_spec(
             table,
         });
     }
+    
+    println!("  Prefix code_spec (parse_prefix_code_spec) complete at bit_pos {}", reader.get_bit_position());
     
     Ok(CodeSpec {
         num_dist: effective_num_dist,
@@ -880,29 +956,200 @@ fn parse_prefix_code_tree(reader: &mut BitstreamReader, l2size: usize) -> JxlRes
         return Ok((max_len, max_len, table));
     }
     
-    // Complex prefix codes (sections 3.5) - need full implementation
-    // For now, create a simple fallback table
-    println!("    Warning: Complex prefix codes (hskip={}) using fallback", hskip);
+    // Complex prefix codes (sections 3.5) - RFC 7932 section 3
+    println!("    Parsing complex prefix codes (hskip={}) for l2size={}", hskip, l2size);
     
-    // Create a simple table that maps each value to itself
-    let max_len = (ceil_log2(l2size as u32) as i16).max(1);
-    let table_size = 1usize << max_len;
-    let mut table = vec![0u32; table_size];
+    // Constants from j40
+    const L1SIZE: usize = 18;
+    const L0MAXLEN: i32 = 4;
+    const L1MAXLEN: i32 = 5;
+    const L2MAXLEN: i32 = 15;
+    const L1CODESUM: i32 = 1 << L1MAXLEN; // 32
+    const L2CODESUM: i32 = 1 << L2MAXLEN; // 32768
     
-    // Each entry: (symbol << 16) | length
-    for i in 0..table_size {
-        let symbol = (i % l2size) as u32;
-        table[i] = (symbol << 16) | (max_len as u32);
+    // Layer 0 table (fixed for decoding layer 1 code lengths)
+    static L0TABLE: [u32; 16] = [
+        0x00002, 0x40002, 0x30002, 0x20003, 0x00002, 0x40002, 0x30002, 0x10004,
+        0x00002, 0x40002, 0x30002, 0x20003, 0x00002, 0x40002, 0x30002, 0x50004,
+    ];
+    
+    // Zigzag order for layer 1
+    static L1ZIGZAG: [usize; L1SIZE] = [1,2,3,4,0,5,17,6,16,7,8,9,10,11,12,13,14,15];
+    
+    // REV5: bit reversal for 5-bit values
+    static REV5: [u8; 32] = [
+        0, 16, 8, 24, 4, 20, 12, 28, 2, 18, 10, 26, 6, 22, 14, 30,
+        1, 17, 9, 25, 5, 21, 13, 29, 3, 19, 11, 27, 7, 23, 15, 31,
+    ];
+    
+    // Read layer 1 code lengths using layer 0 code
+    let mut l1lengths = [0i32; L1SIZE];
+    let mut l1counts = [0i32; (L1MAXLEN + 1) as usize];
+    l1counts[0] = hskip as i32;
+    
+    let mut total: i32 = 0;
+    let mut i = hskip as usize;
+    while i < L1SIZE && total < L1CODESUM {
+        // Decode using layer 0 prefix code
+        let bits = reader.peek_bits(L0MAXLEN as usize)?;
+        let entry = L0TABLE[bits as usize];
+        let code = (entry >> 16) as i32;
+        let code_len = (entry & 0xFFFF) as i32;
+        reader.skip_bits(code_len as usize);
+        
+        l1lengths[L1ZIGZAG[i]] = code;
+        l1counts[code as usize] += 1;
+        if code != 0 {
+            total += L1CODESUM >> code;
+        }
+        i += 1;
     }
     
-    // Skip some bits as placeholder for the complex code
-    // This is a crude approximation
-    let bits_to_skip = (l2size * 3).min(100);
-    for _ in 0..bits_to_skip {
-        let _ = reader.read_bool();
+    if total != L1CODESUM || l1counts[0] == i as i32 {
+        return Err(JxlError::ParseError(format!(
+            "Invalid layer 1 prefix code: total={}, expected {}", total, L1CODESUM
+        )));
     }
     
-    Ok((max_len, max_len, table))
+    // Construct layer 1 table
+    let mut l1table = [0u32; 32]; // 1 << L1MAXLEN
+    
+    if l1counts[0] == (i as i32) - 1 {
+        // Special case: single code repeats
+        let single_sym = l1lengths.iter().position(|&x| x == 0).unwrap_or(0);
+        for code in 0..L1CODESUM {
+            l1table[code as usize] = single_sym as u32;
+        }
+    } else {
+        let mut l1starts = [0i32; (L1MAXLEN + 2) as usize];
+        l1starts[1] = 0;
+        for j in 2..=(L1MAXLEN as usize) {
+            l1starts[j] = l1starts[j - 1] + (l1counts[j - 1] << (L1MAXLEN as usize - (j - 1)));
+        }
+        
+        for sym in 0..L1SIZE {
+            let n = l1lengths[sym];
+            if n == 0 { continue; }
+            let start = &mut l1starts[n as usize];
+            let mut code = REV5[(*start & 31) as usize] as i32;
+            while code < L1CODESUM {
+                l1table[code as usize] = ((sym as u32) << 16) | (n as u32);
+                code += 1 << n;
+            }
+            *start += L1CODESUM >> n;
+        }
+    }
+    
+    // Read layer 2 code lengths using layer 1 code
+    let mut l2lengths = vec![0i32; l2size];
+    let mut l2counts = [0i32; (L2MAXLEN + 1) as usize];
+    let mut prev = 8i32;
+    let mut prev_rep = 0i32;
+    
+    i = 0;
+    total = 0;
+    while i < l2size && total < L2CODESUM {
+        // Decode using layer 1 prefix code
+        let bits = reader.peek_bits(L1MAXLEN as usize)?;
+        let entry = l1table[bits as usize];
+        let code = if entry == 0 {
+            // Single symbol case
+            0
+        } else {
+            let sym = (entry >> 16) as i32;
+            let code_len = (entry & 0xFFFF) as i32;
+            reader.skip_bits(code_len as usize);
+            sym
+        };
+        
+        if code < 16 {
+            l2lengths[i] = code;
+            l2counts[code as usize] += 1;
+            if code != 0 {
+                total += L2CODESUM >> code;
+                prev = code;
+            }
+            prev_rep = 0;
+            i += 1;
+        } else if code == 16 {
+            // Repeat non-zero 3+u(2) times
+            if prev_rep < 0 { prev_rep = 0; }
+            let extra = reader.read_bits(2)? as i32;
+            let rep = if prev_rep > 0 { 4 * prev_rep - 5 } else { 3 } + extra;
+            if i + ((rep - prev_rep) as usize) > l2size {
+                return Err(JxlError::ParseError("Prefix code repeat overflow".to_string()));
+            }
+            total += (L2CODESUM * (rep - prev_rep)) >> prev;
+            l2counts[prev as usize] += rep - prev_rep;
+            while prev_rep < rep {
+                l2lengths[i] = prev;
+                prev_rep += 1;
+                i += 1;
+            }
+        } else {
+            // code == 17: repeat zero 3+u(3) times
+            if prev_rep > 0 { prev_rep = 0; }
+            let extra = reader.read_bits(3)? as i32;
+            let rep = if prev_rep < 0 { 8 * prev_rep + 13 } else { -3 } - extra;
+            if i + ((prev_rep - rep) as usize) > l2size {
+                return Err(JxlError::ParseError("Prefix code zero repeat overflow".to_string()));
+            }
+            while prev_rep > rep {
+                l2lengths[i] = 0;
+                prev_rep -= 1;
+                i += 1;
+            }
+        }
+    }
+    
+    if total != L2CODESUM {
+        return Err(JxlError::ParseError(format!(
+            "Invalid layer 2 prefix code: total={}, expected {}", total, L2CODESUM
+        )));
+    }
+    
+    // Determine max_len for layer 2
+    let mut l2starts = [0i32; (L2MAXLEN + 2) as usize];
+    l2starts[1] = 0;
+    let mut max_len = 1i32;
+    for j in 2..=(L2MAXLEN as usize) {
+        l2starts[j] = l2starts[j - 1] + (l2counts[j - 1] << (L2MAXLEN as usize - (j - 1)));
+        if l2counts[j] != 0 {
+            max_len = j as i32;
+        }
+    }
+    
+    // Build layer 2 lookup table
+    let fast_len = max_len.min(8) as i16; // Use at most 8 bits for fast lookup
+    let table_size = 1usize << fast_len;
+    let mut l2table = vec![0u32; table_size];
+    
+    for sym in 0..l2size {
+        let n = l2lengths[sym];
+        if n == 0 { continue; }
+        
+        let start = &mut l2starts[n as usize];
+        // Bit reversal for 15-bit codes
+        let rev_code = (REV5[(*start & 31) as usize] as i32) << 10
+                     | (REV5[((*start >> 5) & 31) as usize] as i32) << 5
+                     | (REV5[((*start >> 10) & 31) as usize] as i32);
+        
+        if n <= fast_len as i32 {
+            let mut code = rev_code;
+            while code < table_size as i32 {
+                l2table[code as usize] = ((sym as u32) << 16) | (n as u32);
+                code += 1 << n;
+            }
+        }
+        // For codes longer than fast_len, we'd need overflow handling
+        // For now, just skip them (may cause issues with very long codes)
+        
+        *start += L2CODESUM >> n;
+    }
+    
+    println!("    Complex prefix code: max_len={}, fast_len={}, table_size={}", max_len, fast_len, table_size);
+    
+    Ok((fast_len, max_len as i16, l2table))
 }
 
 /// Build simple prefix code table (for hskip=1 case)
