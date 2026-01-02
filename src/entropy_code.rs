@@ -263,6 +263,14 @@ impl<'a> CodeState<'a> {
     
     /// Decode a symbol using entropy code (following j40__code)
     pub fn decode(&mut self, reader: &mut BitstreamReader, ctx: usize) -> JxlResult<i32> {
+        // Milestone debug matching j40
+        let cluster_idx = if ctx < self.spec.num_dist { self.spec.cluster_map[ctx] as usize } else { 0 };
+        if self.num_decoded % 10000 == 0 || (self.num_decoded >= 80000 && self.num_decoded <= 85000 && self.num_decoded % 500 == 0) {
+            let abs_bit_pos = reader.get_bit_position() as i64 + 104; // 104 = LfGlobal start
+            println!("[OURS MILESTONE] count={}, ctx={}, cluster={}, ans_state=0x{:08x}, bit_pos={} (abs={})",
+                     self.num_decoded, ctx, cluster_idx, self.ans_state, reader.get_bit_position(), abs_bit_pos);
+        }
+        
         // Handle LZ77 copy
         if self.num_to_copy > 0 {
             println!("    [UNEXPECTED] LZ77 copy path taken! num_to_copy={}, num_decoded={}", 
@@ -290,8 +298,18 @@ impl<'a> CodeState<'a> {
         
         let cluster_idx = self.spec.cluster_map[ctx] as usize;
         
-        // Debug: show cluster mapping at milestones
-        if self.num_decoded % 1000 == 999 && self.num_decoded >= 79999 && self.num_decoded <= 81999 {
+        // Debug: trace first 15 decodes for comparison with j40
+        let trace_early = self.num_decoded <= 15;
+        if trace_early {
+            println!("[OURS DECODE] count={}, ctx={}, cluster_idx={}, state_before=0x{:08x}",
+                     self.num_decoded, ctx, cluster_idx, self.ans_state);
+        }
+        
+        // Debug: show cluster mapping at milestones (expanded range)
+        if self.num_decoded >= 81450 && self.num_decoded <= 81550 {
+            println!("    [DEBUG cluster DETAIL] num_decoded={}, ctx={}, cluster_idx={}, ans_state=0x{:08x}",
+                     self.num_decoded, ctx, cluster_idx, self.ans_state);
+        } else if self.num_decoded % 1000 == 999 && self.num_decoded >= 79999 && self.num_decoded <= 82999 {
             println!("    [DEBUG cluster] num_decoded={}, ctx={}, cluster_idx={}, ans_state_before=0x{:08x}",
                      self.num_decoded, ctx, cluster_idx, self.ans_state);
         }
@@ -515,16 +533,12 @@ impl<'a> CodeState<'a> {
         if need_renorm {
             let low = reader.read_bits(16)?;
             self.ans_state = (self.ans_state << 16) | low;
-            // Debug: log all renormalizations
-            println!("    [ANS renorm] idx={}, old_state=0x{:08x}, new_state=0x{:08x}, bit_pos={}",
-                     self.num_decoded, old_state, self.ans_state, reader.get_bit_position());
         }
         
         // Debug output at regular intervals to track bit position growth
         let next_idx = self.num_decoded;
-        // Track at milestones
-        let is_milestone = next_idx % 1000 == 999 && next_idx >= 79999 && next_idx <= 81999;
-        if is_milestone {
+        // Track ANS decodes at milestones and near 80000
+        if next_idx % 10000 == 0 || (next_idx >= 79990 && next_idx <= 80020) {
             println!("[OURS ANS] count={}, state=0x{:08x}, sym={}, bit_pos={}",
                      next_idx, self.ans_state, symbol, reader.get_bit_position());
         }

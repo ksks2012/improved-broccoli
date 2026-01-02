@@ -106,6 +106,7 @@ impl Frame {
 pub struct JxlDecoder {
     data: Vec<u8>,
     position: usize,
+    frame_header_bit_offset: Option<usize>,  // Bit offset within frame header byte for TOC parsing
     image_info: Option<ImageInfo>,
     header: Option<JxlImageHeader>,
     color_encoding: Option<ColorEncoding>,
@@ -135,6 +136,7 @@ impl JxlDecoder {
         let mut decoder = Self {
             data,
             position: 0,
+            frame_header_bit_offset: None,
             image_info: None,
             header: None,
             color_encoding: None,
@@ -588,8 +590,18 @@ impl JxlDecoder {
     
     /// Parse Table of Contents (TOC) after frame header
     fn parse_toc(&mut self) -> JxlResult<usize> {
+        // TOC starts right after frame header, at the same byte but possibly mid-bit
         let remaining_data = self.data[self.position..].to_vec();
         let mut reader = BitstreamReader::new(remaining_data);
+        
+        // Skip to the bit position where frame header ended
+        if let Some(bit_offset) = self.frame_header_bit_offset {
+            // Skip to the correct bit position within the byte stream
+            for _ in 0..bit_offset {
+                reader.read_bool()?;
+            }
+            println!("DEBUG: TOC starts at bit_pos {} within frame header data", bit_offset);
+        }
         
         // Get frame dimensions and parameters for nsections calculation
         let info = self.image_info.as_ref().ok_or_else(|| 
@@ -625,7 +637,9 @@ impl JxlDecoder {
                  num_groups, num_lf_groups, num_passes, nsections);
         
         // Read permuted flag (1 bit)
+        println!("DEBUG: TOC before permuted at bit_pos={}", reader.get_bit_position());
         let permuted = reader.read_bool()?;
+        println!("DEBUG: TOC permuted={}, bit_pos now={}", permuted, reader.get_bit_position());
         if permuted {
             // TODO: Handle permuted TOC with code_spec and permutation
             println!("Warning: Permuted TOC not yet fully supported");
@@ -633,15 +647,18 @@ impl JxlDecoder {
         }
         
         // Align to byte boundary after permuted flag (and potential permutation data)
+        println!("DEBUG: TOC before zero_pad, bit_pos={}", reader.get_bit_position());
         reader.align_to_byte();
+        println!("DEBUG: TOC after zero_pad, bit_pos={}", reader.get_bit_position());
         
         let mut section_sizes = Vec::new();
         
+        println!("DEBUG: TOC before section_size, bit_pos={}", reader.get_bit_position());
         if nsections == 1 {
             // Single section case
             let single_size = reader.read_u32_with_config(0, 10, 1024, 14, 17408, 22, 4211712, 30)? as usize;
             section_sizes.push(single_size);
-            println!("DEBUG: TOC single_size = {} bytes", single_size);
+            println!("DEBUG: TOC single_size = {} bytes, bit_pos now={}", single_size, reader.get_bit_position());
         } else {
             // Multiple sections case
             for i in 0..nsections {
@@ -652,7 +669,9 @@ impl JxlDecoder {
         }
         
         // Align to byte boundary again - this is where LfGlobal data starts
+        println!("DEBUG: TOC before final zero_pad, bit_pos={}", reader.get_bit_position());
         reader.align_to_byte();
+        println!("DEBUG: TOC after final zero_pad, bit_pos={}", reader.get_bit_position());
         
         println!("DEBUG: After TOC, bit_pos={}, byte_pos={}", 
                  reader.get_bit_position(), reader.byte_position());
@@ -762,85 +781,40 @@ impl JxlDecoder {
             return Ok(()); // Already parsed
         }
 
-        // Try to find frame header starting position
-        // In JPEG XL, frame header follows image header and extensions
-        // Let's try different positions to find the frame header
+        // Frame header starts at byte-aligned position after image header
+        // In JPEG XL, frame header follows image header with zero padding to byte boundary
+        let start_pos = self.position;
         
-        let mut attempts = vec![
-            self.position,           // Current position
-            self.position + 1,       // Skip 1 byte
-            self.position + 2,       // Skip 2 bytes  
-            self.position + 3,       // Skip 3 bytes
-            self.position + 4,       // Skip 4 bytes
-            self.position + 8,       // Skip 8 bytes
-        ];
-        
-        for &start_pos in &attempts {
-            if start_pos + 4 > self.data.len() {
-                continue;
-            }
-            
-            let remaining_data = self.data[start_pos..].to_vec();
-            let mut reader = BitstreamReader::new(remaining_data);
-            
-            // Debug: Show bytes at this position
-            if start_pos < self.data.len() {
-                let bytes_to_show = 10.min(self.data.len() - start_pos);
-                println!("DEBUG: Trying frame header at offset {}, bytes: {:02X?}", 
-                         start_pos, &self.data[start_pos..start_pos + bytes_to_show]);
-            }
-            
-            // Try to parse frame header at this position
-            match FrameHeader::parse(&mut reader, false) {
-                Ok(frame_header) => {
-                    println!("DEBUG: Found frame header at offset {}, reader consumed {} bytes", 
-                             start_pos, reader.byte_position());
-                    println!("  Frame encoding: {:?}", frame_header.encoding);
-                    self.position = start_pos + reader.byte_position();
-                    println!("  Updated position to: {}", self.position);
-                    self.frame_header = Some(frame_header);
-                    return Ok(());
-                }
-                Err(e) => {
-                    println!("DEBUG: Failed to parse frame header at offset {}: {}", start_pos, e);
-                    continue; // Try next position
-                }
-            }
+        if start_pos + 4 > self.data.len() {
+            return Err(JxlError::ParseError("Not enough data for frame header".to_string()));
         }
         
-        // If we can't find frame header, create a default one
-        // println!("DEBUG: Could not find frame header, using default");
-        self.frame_header = Some(FrameHeader {
-            frame_type: FrameType::RegularFrame,
-            encoding: FrameEncoding::VarDct,  // Default to VarDct
-            flags: 0,
-            duration: 0,
-            timecode: 0,
-            name_length: 0,
-            is_last: false,
-            save_as_reference: 0,
-            save_before_ct: false,
-            have_crop: false,
-            x0: 0,
-            y0: 0,
-            width: 0,
-            height: 0,
-            blending_info: None,
-            extra_channel_blending: Vec::new(),
-            upsampling: 1,
-            ec_upsampling: Vec::new(),
-            group_size_shift: 1,
-            x_qm_scale: 2,
-            b_qm_scale: 2,
-            num_passes: 1,
-            passes_def: Vec::new(),
-            downsample: 1,
-            loop_filter: false,
-            jpeg_upsampling: Vec::new(),
-            jpeg_upsampling_x: Vec::new(),
-            jpeg_upsampling_y: Vec::new(),
-        });
+        let remaining_data = self.data[start_pos..].to_vec();
+        let mut reader = BitstreamReader::new(remaining_data);
         
+        // Debug: Show bytes at this position
+        let bytes_to_show = 10.min(self.data.len() - start_pos);
+        println!("DEBUG: Parsing frame header at offset {}, bytes: {:02X?}", 
+                 start_pos, &self.data[start_pos..start_pos + bytes_to_show]);
+        
+        // Try to parse frame header
+        let frame_header = FrameHeader::parse(&mut reader, false)?;
+        
+        // Record the exact bit position after frame header
+        let bit_pos_after_frame_header = reader.get_bit_position();
+        println!("DEBUG: Frame header parsed, bit_pos={}, byte_pos={}", 
+                 bit_pos_after_frame_header, reader.byte_position());
+        println!("  Frame encoding: {:?}", frame_header.encoding);
+        
+        // Store bit offset for TOC parsing
+        // TOC permuted flag is read immediately after frame header (no zero pad between them)
+        self.frame_header_bit_offset = Some(bit_pos_after_frame_header);
+        
+        // Update position to byte-aligned position (TOC will read permuted from the remaining bits)
+        self.position = start_pos;  // Keep at start, TOC will use bit offset
+        println!("  Frame header start position: {}", self.position);
+        
+        self.frame_header = Some(frame_header);
         Ok(())
     }
 

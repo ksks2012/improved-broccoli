@@ -105,11 +105,12 @@ fn div24_p1(i: usize) -> i32 {
 impl Default for WpParams {
     fn default() -> Self {
         // Default WP parameters from JXL spec
+        // Note: w[0] is 13, not 12! (j40: 12 + (i < 1) for each i)
         Self {
             p1: 16,
             p2: 10,
             p3: [7, 7, 7, 0, 0],
-            w: [12, 12, 12, 12],
+            w: [13, 12, 12, 12],  // w[0]=13, w[1-3]=12
         }
     }
 }
@@ -236,6 +237,62 @@ impl WeightedPredictor {
             println!("      [before_predict ({},{})]: pred[4]={}, w={}, n={}, ne={}, nn={}, nw={}", 
                 x, y, self.pred[4], w, n, ne, nn, nw);
         }
+        // Debug: trace pred[4] at (0, 4) for ch2
+        if x == 0 && y == 4 {
+            println!("      [before_predict ({},{})]: pred[4]={}, w={}, n={}, ne={}, nn={}, nw={}", 
+                x, y, self.pred[4], w, n, ne, nn, nw);
+            println!("        pred[0-3]={:?}", &self.pred[0..4]);
+            println!("        w_weights={:?}, logw={}", w_weights, logw);
+            println!("        sum={}, wsum={}", sum, wsum);
+            println!("        trueerrw={}, trueerrn={}, trueerrnw={}, trueerrne={}", 
+                self.trueerrw, self.trueerrn, self.trueerrnw, self.trueerrne);
+            println!("        p1={}, p2={}, p3={:?}", self.params.p1, self.params.p2, self.params.p3);
+        }
+        // Debug: trace pred[4] at (0, 3) for ch2
+        if x == 0 && y == 3 {
+            println!("      [before_predict ({},{})]: pred[4]={}, w={}, n={}, ne={}, nn={}, nw={}", 
+                x, y, self.pred[4], w, n, ne, nn, nw);
+            println!("        pred[0-3]={:?}", &self.pred[0..4]);
+            println!("        w_weights={:?}, logw={}", w_weights, logw);
+            println!("        sum={}, wsum={}", sum, wsum);
+            println!("        trueerrw={}, trueerrn={}, trueerrnw={}, trueerrne={}", 
+                self.trueerrw, self.trueerrn, self.trueerrnw, self.trueerrne);
+        }
+        // Debug: trace (1, 1) full calculation
+        if x == 1 && y == 1 {
+            println!("      [before_predict ({},{})]: pred[4]={}, w={}, n={}, ne={}, nn={}, nw={}", 
+                x, y, self.pred[4], w, n, ne, nn, nw);
+            println!("        pred[0-3]={:?}", &self.pred[0..4]);
+            println!("        w_weights={:?}, logw={}", w_weights, logw);
+            println!("        sum={}, wsum={}", sum, wsum);
+            println!("        trueerrw={}, trueerrn={}, trueerrnw={}, trueerrne={}", 
+                self.trueerrw, self.trueerrn, self.trueerrnw, self.trueerrne);
+            println!("        raw_pred4=(sum + wsum/2 - 1)={} * div24_p1[{}]={}",
+                (sum + (wsum/2) as i64 - 1), wsum - 1, DIV24_P1[(wsum - 1) as usize]);
+            // Show err arrays for w[0] calculation
+            println!("        err arrays for w[0]: errn[0]={}, errw[0]={}, errnw[0]={}, errww[0]={}, errne[0]={}, errw2[0]={}", 
+                errn[0], errw[0], errnw[0], errww[0], errne[0], errw2[0]);
+            let errsum0 = errn[0] + errw[0] + errnw[0] + errww[0] + errne[0] + errw2[0];
+            println!("        errsum0={}", errsum0);
+            // Show w[0] calculation details
+            let floor_lg0 = if errsum0 + 1 > 0 { 31 - ((errsum0 + 1) as u32).leading_zeros() as i32 } else { 0 };
+            let shift0 = (floor_lg0 - 5).max(0);
+            let idx0 = (errsum0 >> shift0) as usize;
+            println!("        w[0] calc: floor_lg={}, shift={}, idx={}, params.w[0]={}, div24_p1[{}]={}", 
+                floor_lg0, shift0, idx0, self.params.w[0], idx0, div24_p1(idx0));
+            println!("        w[0] = 4 + ({} * {} >> {}) = 4 + {} = {}", 
+                self.params.w[0], div24_p1(idx0), shift0, 
+                ((self.params.w[0] as i64 * div24_p1(idx0) as i64) >> shift0) as i32,
+                4 + ((self.params.w[0] as i64 * div24_p1(idx0) as i64) >> shift0) as i32);
+        }
+        // Debug: trace trueerr values at (0, 5)
+        if x == 0 && y == 5 {
+            println!("      [before_predict ({},{})]: trueerrw={}, trueerrn={}, trueerrnw={}, trueerrne={}, max={}", 
+                x, y, self.trueerrw, self.trueerrn, self.trueerrnw, self.trueerrne, self.max_error());
+            println!("        nerr[0][4]={}, nerr[1][4]={}", 
+                self.errors[(y + 1) & 1].get(0).map(|e| e[4]).unwrap_or(-999),
+                self.errors[(y + 1) & 1].get(1).map(|e| e[4]).unwrap_or(-999));
+        }
     }
     
     /// Update error history after decoding a pixel
@@ -255,6 +312,31 @@ impl WeightedPredictor {
         if y == 4 && x == 1 {
             println!("      [after_predict ({},{})]: pred[4]={}, val*8={}, err[4]={}", 
                 x, y, self.pred[4], val * 8, err[4]);
+        }
+        // Debug: trace error at position (0, 4) which will be used as trueerrn at (0, 5)
+        if y == 4 && x == 0 {
+            println!("      [after_predict ({},{})]: pred[4]={}, val*8={}, err[4]={}", 
+                x, y, self.pred[4], val * 8, err[4]);
+        }
+        // Debug: trace error at positions (0, 3) and (1, 3) which provide trueerrn/ne for (0, 4)
+        if y == 3 && (x == 0 || x == 1) {
+            println!("      [after_predict ({},{})]: pred[4]={}, val*8={}, err[4]={}", 
+                x, y, self.pred[4], val * 8, err[4]);
+        }
+        // Debug: trace error at position (0, 2) which will be used as trueerrn at (0, 3)
+        if y == 2 && x == 0 {
+            println!("      [after_predict ({},{})]: pred[4]={}, val*8={}, err[4]={}", 
+                x, y, self.pred[4], val * 8, err[4]);
+        }
+        // Debug: trace ch2 row 0, 1, 2 for first few pixels
+        if y <= 2 && x < 5 {
+            println!("      [after_predict_detail ({},{})]: pred[4]={}, val*8={}, err[4]={}", 
+                x, y, self.pred[4], val * 8, err[4]);
+        }
+        // Debug: trace ch2 (1, 1) before_predict detail
+        if x == 1 && y == 1 {
+            println!("      [after_predict_1_1]: pred[0-4]={:?}, val*8={}, err={:?}", 
+                self.pred, val * 8, err);
         }
         // Debug: trace (198, 58) which provides trueerrne for (197, 59)
         if y == 58 && x == 198 {
@@ -1972,6 +2054,22 @@ impl ModularDecoder {
                             println!("        wp: trueerrw={}, trueerrn={}, trueerrnw={}, trueerrne={}, max={}",
                                 wp.trueerrw, wp.trueerrn, wp.trueerrnw, wp.trueerrne, prop_val);
                         }
+                    } else if channel_idx == 2 && (y * width + x) == 1000 {
+                        // Debug ch2 px 1000 tree traversal (corresponds to count ~81000)
+                        let offset = if prop_val > node.value { node.left_child } else { node.right_child };
+                        let next_idx = node_idx as i32 + offset;
+                        println!("[OURS TRAVERSE ch2 px=1000 ({},{})] node={}, prop={}, propval={}, branch={}, offset={}, next={}",
+                            x, y, node_idx, prop_id, prop_val, node.value, offset, next_idx);
+                        if prop_id == 15 {
+                            println!("  wp: trueerrw={}, trueerrn={}, trueerrnw={}, trueerrne={}, max={}",
+                                wp.trueerrw, wp.trueerrn, wp.trueerrnw, wp.trueerrne, prop_val);
+                        }
+                    } else if channel_idx == 2 && y == 4 && x >= 195 && x <= 199 {
+                        // Debug ch2 row 4 pixels near end (provides trueerr for row 5 pixels)
+                        let offset = if prop_val > node.value { node.left_child } else { node.right_child };
+                        let next_idx = node_idx as i32 + offset;
+                        println!("[OURS TRAVERSE ch2 ({},{}) px={}] node={}, prop={}, propval={}, branch={}, offset={}, next={}",
+                            x, y, y*width+x, node_idx, prop_id, prop_val, node.value, offset, next_idx);
                     } else if channel_idx == 1 && y == 2 && x < 3 {
                         println!("      [traverse ch1 ({},{}) y=2] node_idx={}, prop_id={}, prop_val={}, value={}", 
                             x, y, node_idx, prop_id, prop_val, node.value);
@@ -2050,8 +2148,10 @@ impl ModularDecoder {
                 
                 // Debug: show progress every 1000 pixels for channel 2
                 let pixel_idx = y * width + x;
-                // Debug for problematic region (ch2 pixel 590-810)
-                if channel_idx == 2 && pixel_idx >= 590 && pixel_idx <= 810 {
+                // Debug for problematic region (ch2 pixel 0-10, 400-410, 600-610, 800-810, 590-4000)
+                if channel_idx == 2 && (pixel_idx < 10 || (pixel_idx >= 400 && pixel_idx <= 410) || 
+                    (pixel_idx >= 600 && pixel_idx <= 610) || (pixel_idx >= 800 && pixel_idx <= 810) ||
+                    (pixel_idx >= 590 && pixel_idx <= 4000)) {
                     println!("    [ch2 DETAIL ({},{})] px={}, ctx={}, token={}, res={}, pred={}, val={}, bit_pos={}",
                         x, y, pixel_idx, ctx, token, residual, prediction, pixel_val,
                         reader.get_bit_position());
